@@ -1,0 +1,107 @@
+[time]
+ticks_per_day    = 48   # Each tick ~ 30 minutes
+day_start_tick   = 0    # Tick 0 = dawn
+night_start_tick = 32   # Tick 32 = nightfall (~4 PM)
+
+[needs.decay_per_tick]
+hunger  = 1.5
+energy  = 1.2
+fun     = 0.8
+social  = 0.6
+hygiene = 0.3
+
+[needs.initial]
+hunger  = 80.0
+energy  = 80.0
+fun     = 80.0
+social  = 80.0
+hygiene = 80.0
+
+[needs.thresholds]
+penalty_mild   = 20.0   # Below this: -2 to relevant checks
+penalty_severe = 10.0   # Below this: -4 to relevant checks
+forced_action  = 5.0    # Below this: forced (e.g., forced sleep)
+
+[actions.eat]
+hunger_restore = 30.0
+dc = 0
+
+[actions.cook]
+hunger_restore = 45.0
+fun_restore    = 10.0
+dc             = 12
+attribute      = "wit"
+
+[actions.sleep]
+duration_ticks          = 16
+energy_restore_per_tick = 6.25   # 16 * 6.25 = 100 (full refill)
+dc                      = 0
+
+[actions.rest]
+energy_restore = 15.0
+dc             = 0
+
+[actions.forage]
+hunger_restore = 20.0
+dc             = 10
+attribute      = "grace"
+
+[actions.fish]
+hunger_restore = 35.0
+fun_restore    = 10.0
+dc             = 12
+attribute      = "grace"
+
+[actions.exercise]
+fun_restore   = 15.0
+energy_drain  = 10.0
+dc            = 10
+attribute     = "vigor"
+
+[actions.chat]
+social_restore = 20.0
+fun_restore    = 8.0
+dc             = 8
+attribute      = "heart"
+
+[actions.bathe]
+hygiene_restore = 50.0
+dc              = 0
+
+[actions.explore]
+fun_restore = 20.0
+dc          = 12
+attribute   = "vigor"
+
+[actions.play]
+fun_restore = 15.0
+dc          = 0
+
+[actions.cast_intent]
+min_duration_ticks = 1
+max_duration_ticks = 4
+energy_drain       = 8.0
+dc                 = 0        # Spells always succeed
+attribute          = "numen"  # Governs clarity, not success
+
+[resolution]
+crit_fail     = 1
+crit_success  = 20
+dc_easy       = 8
+dc_medium     = 12
+dc_hard       = 16
+night_dc_bonus = 4   # Added to Forage/Explore DCs at night
+
+[memory]
+buffer_size = 20
+
+[simulation]
+default_run_ticks    = 144   # 3 days
+state_dump_interval  = 48    # Dump every in-game day
+
+[llm]
+model                  = "gemma3:4b"
+temperature            = 0.7
+max_tokens             = 150
+ollama_url             = "http://localhost:11434"
+interpreter_max_tokens = 300
