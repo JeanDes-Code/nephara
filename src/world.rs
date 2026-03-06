@@ -26,7 +26,7 @@ pub const GRID_H: usize = 32;
 pub const HOME_POSITIONS: &[(u8, u8)] = &[
     (5, 17),   // agent 0: Elara
     (8, 22),   // agent 1: Rowan
-    (19, 22),  // agent 2: Thane
+    (23, 22),  // agent 2: Thane  ← was (19, 22), inside river bend
 ];
 
 fn home_pos_for(idx: usize) -> (u8, u8) {
@@ -157,7 +157,7 @@ fn build_resource_nodes() -> Vec<ResourceNode> {
         });
     }
 
-    for &pos in &[(5u8, 17u8), (8, 22), (19, 22)] {
+    for &pos in &[(5u8, 17u8), (8, 22), (23, 22)] {
         nodes.push(ResourceNode {
             kind: ResourceKind::Campfire,
             pos,
@@ -2009,9 +2009,13 @@ fn build_grid() -> [[TileType; GRID_W]; GRID_H] {
     // Temple: rows 10..13, cols 8..12 (north of Village Square)
     for row in 10..13 { for col in 8..12 { g[row][col] = TileType::Temple; } }
 
-    // Home tiles
+    // Home tiles (2×3 block: 3 wide, 2 tall; HOME_POSITIONS is top-left corner)
     for (i, &(hx, hy)) in HOME_POSITIONS.iter().enumerate() {
-        g[hy as usize][hx as usize] = TileType::Home(i);
+        for dy in 0..2usize {
+            for dx in 0..3usize {
+                g[hy as usize + dy][hx as usize + dx] = TileType::Home(i);
+            }
+        }
     }
 
     g
