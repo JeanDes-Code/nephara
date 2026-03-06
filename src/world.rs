@@ -399,6 +399,7 @@ impl World {
                     warn!("LLM error for {}: {}", self.agents[idx].name(), e);
                     String::new()
                 });
+            self.run_log.write_llm_debug("action", self.agents[idx].name(), &prompt, &raw);
             debug!(target: "action", agent = %self.agents[idx].name(), raw = %raw, "Agent action response");
             action::parse_response(&raw)
         };
@@ -649,7 +650,10 @@ impl World {
                 let narrator_max = self.config.llm.narrator_max_tokens;
                 debug!(target: "narrate", agent = %agent_name_str, action = %res.action.display(),
                        tier = %res.tier.label(), "DM Narrator prompt sent");
-                let narrative = match llm.generate(&dm_prompt, narrator_max, call_seed, None).await {
+                let narrator_result = llm.generate(&dm_prompt, narrator_max, call_seed, None).await;
+                self.run_log.write_llm_debug("narrator", &agent_name_str, &dm_prompt,
+                    narrator_result.as_ref().map(|s| s.as_str()).unwrap_or(""));
+                let narrative = match narrator_result {
                     Ok(n) if !n.trim().is_empty() => {
                         let n = n.trim().to_string();
                         debug!(target: "narrate", narrative = %n, "GM Narrator response");
@@ -773,6 +777,9 @@ impl World {
             .unwrap_or_else(|_| {
                 format!("{} and {} exchange a few words.", self.agents[idx].name(), self.agents[target_idx].name())
             });
+        self.run_log.write_llm_debug("chat",
+            &format!("{}&{}", self.agents[idx].name(), self.agents[target_idx].name()),
+            &chat_prompt, &raw_chat);
         let (summary, exchange) = Self::parse_chat_response(&raw_chat);
 
         let res = {
@@ -843,6 +850,7 @@ impl World {
             .generate(&prompt, self.config.llm.interpreter_max_tokens, call_seed, None)
             .await
             .unwrap_or_default();
+        self.run_log.write_llm_debug("cast_intent", self.agents[idx].name(), &prompt, &raw);
 
         let energy_drain = self.config.actions.cast_intent.energy_drain.unwrap_or(8.0);
         let interpreted  = magic::parse_interpreter_response(&raw)
@@ -1034,6 +1042,7 @@ impl World {
                 format!("{} stands in silent awe.", name)
             });
         let reaction = reaction.trim().to_string();
+        self.run_log.write_llm_debug("oracle", &name, &prompt, &reaction);
 
         if !self.is_test_run {
             runlog::archive_oracle_response(&self.souls_dir, &name, content.trim());
@@ -1242,6 +1251,7 @@ Choose ONE action. Respond with ONLY a JSON object:
                 warn!("Planning LLM error for {}: {}", self.agents[idx].name(), e);
                 String::new()
             });
+        self.run_log.write_llm_debug("planning", self.agents[idx].name(), &prompt, &response);
         let trimmed = response.trim().to_string();
         if !trimmed.is_empty() {
             debug!(target: "planning", agent = %self.agents[idx].name(), day = day,
@@ -1276,6 +1286,7 @@ Choose ONE action. Respond with ONLY a JSON object:
                 warn!("Reflection LLM error for {}: {}", self.agents[idx].name(), e);
                 String::new()
             });
+        self.run_log.write_llm_debug("reflection", self.agents[idx].name(), &prompt, &response);
         let trimmed = response.trim().to_string();
         if !trimmed.is_empty() {
             let name      = self.agents[idx].name().to_string();
@@ -1314,6 +1325,7 @@ Choose ONE action. Respond with ONLY a JSON object:
                 warn!("Desires LLM error for {}: {}", self.agents[idx].name(), e);
                 String::new()
             });
+        self.run_log.write_llm_debug("desires", self.agents[idx].name(), &prompt, &response);
         let trimmed = response.trim().to_string();
         if !trimmed.is_empty() {
             let name      = self.agents[idx].name().to_string();
@@ -1347,6 +1359,7 @@ Choose ONE action. Respond with ONLY a JSON object:
                     warn!("End-of-run desires LLM error for {}: {}", self.agents[idx].name(), e);
                     String::new()
                 });
+            self.run_log.write_llm_debug("end_of_run", self.agents[idx].name(), &prompt, &response);
             let trimmed = response.trim().to_string();
             if !trimmed.is_empty() {
                 let name      = self.agents[idx].name().to_string();

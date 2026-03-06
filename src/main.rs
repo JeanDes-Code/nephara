@@ -5,7 +5,10 @@ mod config;
 mod llm;
 mod log;
 mod magic;
+mod sim_runner;
 mod soul;
+mod tui;
+mod tui_event;
 mod world;
 
 use std::sync::Arc;
@@ -58,6 +61,14 @@ struct Cli {
     /// Enable debug logging.
     #[arg(long)]
     verbose: bool,
+
+    /// Use streaming terminal output instead of the fullscreen TUI.
+    #[arg(long)]
+    no_tui: bool,
+
+    /// Write full LLM prompts and responses to runs/{id}/llm_debug.md
+    #[arg(long, default_value_t = false)]
+    debug_llm: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,19 +79,8 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
 
-    // Logging
-    let filter = if cli.verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .init();
-
     if let Err(e) = run(cli).await {
-        error!("Fatal error: {}", e);
+        eprintln!("Fatal error: {}", e);
         std::process::exit(1);
     }
 }
@@ -94,16 +94,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Loaded config from '{}'", cli.config);
 
     // --- Seed ---
-    let seed: u64 = cli.seed.unwrap_or_else(|| {
-        rand::thread_rng().gen()
-    });
+    let seed: u64 = cli.seed.unwrap_or_else(|| rand::thread_rng().gen());
     info!("Simulation seed: {}", seed);
 
-    // Top-level RNG seeded deterministically
-    let rng = StdRng::seed_from_u64(seed);
-
-    // Mock backend gets its own seeded RNG derived from main seed
-    // so its outputs are also deterministic.
+    let rng      = StdRng::seed_from_u64(seed);
     let mock_rng = StdRng::seed_from_u64(seed.wrapping_add(0xDEAD_BEEF));
 
     // --- LLM backend ---
@@ -112,7 +106,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             info!("Using MockBackend (no LLM required)");
             Arc::new(MockBackend::new(mock_rng))
         }
-        "ollama" | _ => {
+        _ => {
             info!("Using OllamaBackend — model: {}, url: {}", cfg.llm.model, cfg.llm.ollama_url);
             let ollama = OllamaBackend::new(
                 cfg.llm.ollama_url.clone(),
@@ -127,7 +121,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    // --- Smart backend (for planning/reflection/desires) ---
+    // --- Smart backend ---
     let smart_backend: Arc<dyn LlmBackend> = match cli.llm.as_str() {
         "mock" => Arc::clone(&backend),
         _ => match &cfg.llm.smart_model.clone() {
@@ -150,64 +144,150 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // --- Soul seeds ---
     let souls = soul::load_all(&cli.souls)?;
-    info!("Loaded {} soul seeds: {}", souls.len(), souls.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
+    info!("Loaded {} soul seeds: {}", souls.len(),
+        souls.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
 
     // --- Run log ---
-    let run_log = RunLog::new(seed)?;
+    let mut run_log = RunLog::new(seed)?;
+    run_log.debug_llm = cli.debug_llm;
+
+    // --- Tracing init (deferred so TUI mode can route to file) ---
+    let log_filter = if cli.verbose { "debug" } else { "info" };
+    if cli.no_tui {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_filter)))
+            .with_target(true)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        let trace_path = format!("runs/{}/trace.log", run_log.run_id);
+        if let Ok(file) = std::fs::File::create(&trace_path) {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::new(log_filter))
+                .with_writer(move || file.try_clone().unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap()))
+                .try_init();
+        }
+    }
+
     info!("Run output: runs/{}/", run_log.run_id);
 
     // --- World ---
     let is_test_run = cli.llm == "mock";
-    let mut world = World::new(souls, cfg.clone(), seed, rng, backend, smart_backend, run_log, cli.souls.clone(), is_test_run);
+    let mut world = World::new(
+        souls, cfg.clone(), seed, rng,
+        backend, smart_backend, run_log, cli.souls.clone(), is_test_run,
+    );
     world.load_stories().await;
 
     let total_ticks = cli.ticks.unwrap_or(cfg.simulation.default_run_ticks);
 
+    if cli.no_tui {
+        run_streaming(world, total_ticks, seed, &cli.llm, &cli.souls, &cfg).await
+    } else {
+        run_tui(world, total_ticks, seed, &cli.llm, &cli.souls).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TUI mode
+// ---------------------------------------------------------------------------
+
+async fn run_tui(
+    mut world:    World,
+    total_ticks:  u32,
+    seed:         u64,
+    backend_name: &str,
+    souls_dir:    &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Suppress stdout from run_log in TUI mode
+    world.run_log.tui_mode = true;
+
+    // Build roster for TUI (name + color)
+    let roster: Vec<(String, ratatui::style::Color)> = world.agents.iter()
+        .map(|a| (
+            a.name().to_string(),
+            color::to_ratatui_color(color::agent_color(a.id)),
+        ))
+        .collect();
+
+    let agent_count   = world.agents.len();
+    let backend_owned = backend_name.to_string();
+    let souls_owned   = souls_dir.to_string();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<tui_event::TuiEvent>(512);
+
+    // Spawn simulation
+    let sim_handle = tokio::spawn(sim_runner::run_simulation(
+        tx, world, total_ticks, seed, backend_owned.clone(), souls_owned,
+    ));
+
+    // Run TUI in a blocking thread (crossterm needs blocking I/O)
+    let tui_handle = tokio::task::spawn_blocking(move || {
+        let mut app = tui::TuiApp::new(agent_count, total_ticks, seed, backend_owned, roster);
+        app.run(rx)
+    });
+
+    // Wait for both
+    if let Err(e) = sim_handle.await? {
+        error!("Simulation error: {}", e);
+    }
+    if let Err(e) = tui_handle.await? {
+        error!("TUI error: {}", e);
+    }
+
+    info!("Run complete. Seed: {}", seed);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming (--no-tui) mode — original behavior
+// ---------------------------------------------------------------------------
+
+async fn run_streaming(
+    mut world:    World,
+    total_ticks:  u32,
+    seed:         u64,
+    backend_name: &str,
+    souls_dir:    &str,
+    cfg:          &config::Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Print banner
     world.run_log.write_line(&format!(
         "Nephara — seed:{} | {} ticks | backend:{}",
-        seed, total_ticks, cli.llm
+        seed, total_ticks, backend_name
     ));
     world.run_log.write_line(&format!(
         "Agents: {}",
         world.agents.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")
     ));
 
-    // --- Simulation loop ---
     for _t in 0..total_ticks {
         let result = world.tick().await?;
 
-        // Print tick header + map
         let header = log::tick_header(result.tick, result.day, result.time_of_day);
         world.run_log.write_line(&header);
         world.run_log.write_line(&result.map);
 
-        // Print entries
         for entry in &result.entries {
             for line in entry.format() {
                 world.run_log.write_line(&line);
             }
         }
 
-        // Print needs footer
         let footer = log::needs_footer(&world.agents);
         world.run_log.write_line(&footer);
 
-        // State dump
         if result.tick > 0 && result.tick % cfg.simulation.state_dump_interval == 0 {
             log::write_state_dump(&world.run_log.run_id, result.tick, &world.agents, seed);
         }
     }
 
-    // --- Final state dump ---
     log::write_state_dump(&world.run_log.run_id, total_ticks, &world.agents, seed);
 
-    // --- End-of-run desires ---
     if let Err(e) = world.end_of_run_desires().await {
         warn!("End-of-run desires failed: {}", e);
     }
 
-    // --- Journal + summary ---
     let notable_by_agent: Vec<Vec<String>> = world.agents.iter().map(|a| {
         world.notable_events.iter()
             .filter(|(id, _)| *id == a.id)
@@ -218,7 +298,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !world.is_test_run {
         for (i, agent) in world.agents.iter().enumerate() {
             log::append_journal(
-                &cli.souls,
+                souls_dir,
                 agent.name(),
                 &world.run_log.run_id,
                 total_ticks,

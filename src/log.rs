@@ -32,6 +32,10 @@ fn strip_ansi(s: &str) -> String {
 pub struct RunLog {
     pub run_id:   String,
     pub log_path: String,
+    /// When true, suppress stdout output (TUI mode — file log still written).
+    pub tui_mode: bool,
+    /// When true, write every LLM prompt+response to runs/{id}/llm_debug.md.
+    pub debug_llm: bool,
 }
 
 impl RunLog {
@@ -41,12 +45,27 @@ impl RunLog {
         let dir    = format!("runs/{}", run_id);
         fs::create_dir_all(&dir)?;
         let log_path = format!("{}/tick_log.txt", dir);
-        Ok(RunLog { run_id, log_path })
+        Ok(RunLog { run_id, log_path, tui_mode: false, debug_llm: false })
     }
 
-    /// Print the colored string to stdout; write plain text to file.
+    /// Append a prompt+response pair to runs/{id}/llm_debug.md (no-op if debug_llm is false).
+    pub fn write_llm_debug(&self, call_type: &str, agent: &str, prompt: &str, response: &str) {
+        if !self.debug_llm { return; }
+        let path = format!("runs/{}/llm_debug.md", self.run_id);
+        let entry = format!(
+            "## {} — {}\n### PROMPT\n```\n{}\n```\n### RESPONSE\n```\n{}\n```\n---\n\n",
+            call_type, agent, prompt, response
+        );
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = IoWrite::write_all(&mut f, entry.as_bytes());
+        }
+    }
+
+    /// Print the colored string to stdout (unless tui_mode); write plain text to file.
     pub fn write_line(&self, line: &str) {
-        println!("{}", line);
+        if !self.tui_mode {
+            println!("{}", line);
+        }
 
         let plain = strip_ansi(line);
         if let Ok(mut f) = OpenOptions::new()
