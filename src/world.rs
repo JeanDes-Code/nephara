@@ -13,6 +13,7 @@ use crate::llm::LlmBackend;
 use crate::log::{self as runlog, RunLog, TickEntry};
 use crate::magic;
 use crate::soul::SoulSeed;
+use crate::tui_event::{AgentNeedsSnapshot, DayEvent, DayEventKind, MapCell};
 
 // ---------------------------------------------------------------------------
 // Grid constants
@@ -204,6 +205,9 @@ pub struct TickResult {
     pub time_of_day: &'static str,
     pub entries:     Vec<TickEntry>,
     pub map:         String,
+    /// Day-boundary events (morning intentions, evening reflections/desires)
+    /// generated during this tick.
+    pub day_events:  Vec<DayEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +226,7 @@ pub struct World {
     pub magic_cast_this_day: Vec<bool>,
     pub resource_nodes:      Vec<ResourceNode>,
     pub is_test_run:         bool,
+    pub pending_day_events:  Vec<DayEvent>,
     grid:                    [[TileType; GRID_W]; GRID_H],
     rng:                     StdRng,
     llm:                     Arc<dyn LlmBackend>,
@@ -262,6 +267,7 @@ impl World {
             magic_cast_this_day: vec![false; seeds.len()],
             resource_nodes,
             is_test_run,
+            pending_day_events: Vec::new(),
             grid,
             rng,
             llm,
@@ -332,8 +338,9 @@ impl World {
 
         self.tick_num += 1;
 
-        let map = self.render_map();
-        Ok(TickResult { tick, day, time_of_day: tod, entries, map })
+        let map        = self.render_map();
+        let day_events = std::mem::take(&mut self.pending_day_events);
+        Ok(TickResult { tick, day, time_of_day: tod, entries, map, day_events })
     }
 
     // -----------------------------------------------------------------------
@@ -1105,11 +1112,12 @@ impl World {
         let viewport    = self.build_viewport(pos, 2);
         let region_note = self.build_region_distances(pos, tile);
 
-        let available   = self.available_actions(idx);
-        let actions_str = available.iter().enumerate()
+        let available        = self.available_actions(idx);
+        let actions_str      = available.iter().enumerate()
             .map(|(i, a)| format!("  {}. {}", i + 1, a))
             .collect::<Vec<_>>()
             .join("\n");
+        let needs_suggestions = self.needs_action_suggestions(idx);
 
         let self_decl_block = if !agent.identity.self_declaration.is_empty() {
             format!("\nIn your own words: \"{}\"\n", agent.identity.self_declaration)
@@ -1176,8 +1184,7 @@ RECENT MEMORY (newest first):
 {memory}{last_action_note}
 
 AVAILABLE ACTIONS:
-{actions}
-
+{actions}{needs_suggestions}
 Magic is real and available to you at any time via cast_intent.
 Speak your desire and it will manifest — though words carry all their meanings.
 {magic_nudge}{oracle_nudge}
@@ -1210,6 +1217,7 @@ Choose ONE action. Respond with ONLY a JSON object:
             memory           = memory_block,
             last_action_note = last_action_note,
             actions          = actions_str,
+            needs_suggestions = needs_suggestions,
             magic_nudge      = magic_nudge,
             oracle_nudge     = oracle_nudge,
         )
@@ -1242,6 +1250,13 @@ Choose ONE action. Respond with ONLY a JSON object:
             let name   = self.agents[idx].name().to_string();
             let run_id = self.run_log.run_id.clone();
             runlog::log_introspection(&run_id, &name, day, "Morning Planning", &trimmed);
+            self.pending_day_events.push(DayEvent {
+                kind:       DayEventKind::MorningIntention,
+                agent_id:   idx,
+                agent_name: name,
+                day,
+                text:       trimmed,
+            });
         }
         Ok(())
     }
@@ -1273,6 +1288,13 @@ Choose ONE action. Respond with ONLY a JSON object:
                 runlog::append_day_journal(&souls_dir, &name, &run_id, day, &trimmed);
             }
             runlog::log_introspection(&run_id, &name, day, "End-of-Day Reflection", &trimmed);
+            self.pending_day_events.push(DayEvent {
+                kind:       DayEventKind::EveningReflection,
+                agent_id:   idx,
+                agent_name: name,
+                day,
+                text:       trimmed,
+            });
         }
         Ok(())
     }
@@ -1302,6 +1324,13 @@ Choose ONE action. Respond with ONLY a JSON object:
                 runlog::append_wishes(&souls_dir, &name, &format!("## Day {}", day), &trimmed);
             }
             runlog::log_introspection(&run_id, &name, day, "End-of-Day Desires", &trimmed);
+            self.pending_day_events.push(DayEvent {
+                kind:       DayEventKind::EveningDesire,
+                agent_id:   idx,
+                agent_name: name,
+                day,
+                text:       trimmed,
+            });
         }
         Ok(())
     }
@@ -1549,30 +1578,71 @@ Respond ONLY with JSON — no other text:
     // -----------------------------------------------------------------------
 
     fn available_actions(&self, idx: usize) -> Vec<String> {
+        let cfg   = &self.config;
         let tile  = self.tile_at(self.agents[idx].pos);
         let pos   = self.agents[idx].pos;
         let mut v = Vec::new();
 
-        if self.tile_allows(tile, "eat")      { v.push("eat (always works)".to_string()); }
-        if self.tile_allows(tile, "cook")     { v.push("cook (Wit check)".to_string()); }
-        if self.is_at_own_home(idx)           { v.push("sleep (always works)".to_string()); }
-        v.push("rest (always works)".to_string());
-        if self.tile_allows(tile, "forage")   { v.push("forage (Grace check)".to_string()); }
-        if self.tile_allows(tile, "fish")     { v.push("fish (Grace check)".to_string()); }
-        if self.tile_allows(tile, "exercise") { v.push("exercise (Vigor check)".to_string()); }
-        if self.tile_allows(tile, "bathe")    { v.push("bathe (always works)".to_string()); }
-        if self.tile_allows(tile, "explore")  { v.push("explore (Vigor check)".to_string()); }
-        if self.tile_allows(tile, "play")     { v.push("play (always works)".to_string()); }
+        if self.tile_allows(tile, "eat") {
+            v.push(format!("eat — restore satiety (+{:.0}, always works)",
+                cfg.actions.eat.hunger_restore.unwrap_or(0.0)));
+        }
+        if self.tile_allows(tile, "cook") {
+            v.push(format!("cook — hearty meal (+{:.0} satiety +{:.0} fun, Wit check dc{})",
+                cfg.actions.cook.hunger_restore.unwrap_or(0.0),
+                cfg.actions.cook.fun_restore.unwrap_or(0.0),
+                cfg.actions.cook.dc));
+        }
+        if self.is_at_own_home(idx) {
+            v.push(format!("sleep — full rest over {} ticks (always works)",
+                cfg.actions.sleep.duration_ticks.unwrap_or(16)));
+        }
+        v.push(format!("rest — recover energy (+{:.0}, always works)",
+            cfg.actions.rest.energy_restore.unwrap_or(0.0)));
+        if self.tile_allows(tile, "forage") {
+            v.push(format!("forage — gather food (+{:.0} satiety on success, Grace check dc{})",
+                cfg.actions.forage.hunger_restore.unwrap_or(0.0), cfg.actions.forage.dc));
+        }
+        if self.tile_allows(tile, "fish") {
+            v.push(format!("fish — catch fish (+{:.0} satiety +{:.0} fun on success, Grace check dc{})",
+                cfg.actions.fish.hunger_restore.unwrap_or(0.0),
+                cfg.actions.fish.fun_restore.unwrap_or(0.0),
+                cfg.actions.fish.dc));
+        }
+        if self.tile_allows(tile, "exercise") {
+            v.push(format!("exercise — physical training (+{:.0} fun, \u{2212}{:.0} energy, Vigor check dc{})",
+                cfg.actions.exercise.fun_restore.unwrap_or(0.0),
+                cfg.actions.exercise.energy_drain.unwrap_or(0.0),
+                cfg.actions.exercise.dc));
+        }
+        if self.tile_allows(tile, "bathe") {
+            v.push(format!("bathe — cleanse yourself (+{:.0} hygiene, always works)",
+                cfg.actions.bathe.hygiene_restore.unwrap_or(0.0)));
+        }
+        if self.tile_allows(tile, "explore") {
+            v.push(format!("explore — discover surroundings (+{:.0} fun, Vigor check dc{})",
+                cfg.actions.explore.fun_restore.unwrap_or(0.0), cfg.actions.explore.dc));
+        }
+        if self.tile_allows(tile, "play") {
+            v.push(format!("play — lighthearted fun (+{:.0} fun, always works)",
+                cfg.actions.play.fun_restore.unwrap_or(0.0)));
+        }
 
         for a in &self.agents {
             if a.id != idx && Self::chebyshev_dist(a.pos, pos) <= 1 && !a.is_busy() {
-                v.push(format!("chat (Heart check) — target: {}", a.name()));
+                v.push(format!("chat — talk with {} (+{:.0} social +{:.0} fun, Heart check dc{})",
+                    a.name(),
+                    cfg.actions.chat.social_restore.unwrap_or(0.0),
+                    cfg.actions.chat.fun_restore.unwrap_or(0.0),
+                    cfg.actions.chat.dc));
             }
         }
 
-        v.push("pray (always works) — speak a prayer; saved to your prayer record".to_string());
+        v.push(format!("pray — speak to the divine (+{:.0} fun +{:.0} social, always works; saved to prayer record)",
+            cfg.actions.pray.fun_restore.unwrap_or(0.0),
+            cfg.actions.pray.social_restore.unwrap_or(0.0)));
         if tile == TileType::Temple && self.agents[idx].oracle_pending {
-            v.push("read_oracle (Temple only) — receive a divine response at the altar".to_string());
+            v.push("read_oracle — receive a divine response at the Temple altar (always works)".to_string());
         }
 
         let regions: &[(&str, TileType)] = &[
@@ -1595,10 +1665,30 @@ Respond ONLY with JSON — no other text:
         }
 
         let numen = self.agents[idx].attributes.numen;
-        let numen_hint = if numen >= 6 { " (strong affinity)" } else if numen >= 4 { "" } else { " (difficult)" };
-        v.push(format!("cast_intent — speak a desire upon reality, always succeeds{}", numen_hint));
+        let affinity = if numen >= 6 { ", strong affinity" } else if numen >= 4 { "" } else { ", weak affinity — results may surprise" };
+        v.push(format!("cast_intent — speak any desire; always manifests in some form (\u{2212}{:.0} energy{})",
+            cfg.actions.cast_intent.energy_drain.unwrap_or(8.0), affinity));
 
         v
+    }
+
+    fn needs_action_suggestions(&self, idx: usize) -> String {
+        let n = &self.agents[idx].needs;
+        let checks: &[(&str, f32, &str)] = &[
+            ("Satiety", n.hunger,  "eat, cook, forage, or fish"),
+            ("Energy",  n.energy,  "rest or sleep"),
+            ("Fun",     n.fun,     "play, explore, fish, exercise, or cast_intent"),
+            ("Social",  n.social,  "chat or pray"),
+            ("Hygiene", n.hygiene, "bathe"),
+        ];
+        let low: Vec<String> = checks.iter()
+            .filter(|(_, v, _)| *v < 50.0)
+            .map(|(label, v, hint)| format!("  \u{2022} {} ({:.0}) \u{2192} {}", label, v, hint))
+            .collect();
+        if low.is_empty() {
+            return String::new();
+        }
+        format!("\nLOW NEEDS — consider:\n{}\n", low.join("\n"))
     }
 
     // -----------------------------------------------------------------------
@@ -1705,6 +1795,67 @@ Respond ONLY with JSON — no other text:
             }
         }).collect();
         result.join("\n")
+    }
+
+    // -----------------------------------------------------------------------
+    // TUI: structured map cells for ratatui rendering
+    // -----------------------------------------------------------------------
+
+    pub fn render_map_cells(&self) -> Vec<Vec<MapCell>> {
+        let mut rows = Vec::with_capacity(GRID_H);
+        for row in 0..GRID_H {
+            let mut cells = Vec::with_capacity(GRID_W);
+            for col in 0..GRID_W {
+                let pos = (col as u8, row as u8);
+
+                // Priority 1: agent
+                if let Some(a) = self.agents.iter().find(|a| a.pos == pos) {
+                    let ch = a.name().chars().next().unwrap_or('?');
+                    cells.push(MapCell {
+                        ch,
+                        color: color::to_ratatui_color(color::agent_color(a.id)),
+                        bold: true,
+                    });
+                    continue;
+                }
+
+                // Priority 2: resource node
+                if let Some(node) = self.resource_nodes.iter().find(|n| n.pos == pos) {
+                    cells.push(MapCell {
+                        ch:    node.map_char(),
+                        color: color::to_ratatui_color(node.node_color()),
+                        bold:  false,
+                    });
+                    continue;
+                }
+
+                // Priority 3: tile
+                let tile = self.grid[row][col];
+                cells.push(MapCell {
+                    ch:    tile_char(tile),
+                    color: color::to_ratatui_color(color::tile_color(tile)),
+                    bold:  false,
+                });
+            }
+            rows.push(cells);
+        }
+        rows
+    }
+
+    // -----------------------------------------------------------------------
+    // TUI: agent needs snapshots
+    // -----------------------------------------------------------------------
+
+    pub fn agent_needs_snapshots(&self) -> Vec<AgentNeedsSnapshot> {
+        self.agents.iter().map(|a| AgentNeedsSnapshot {
+            agent_id:   a.id,
+            agent_name: a.name().to_string(),
+            hunger:     a.needs.hunger,
+            energy:     a.needs.energy,
+            fun:        a.needs.fun,
+            social:     a.needs.social,
+            hygiene:    a.needs.hygiene,
+        }).collect()
     }
 
     // -----------------------------------------------------------------------
