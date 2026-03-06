@@ -10,8 +10,6 @@ pub struct SoulSeed {
     pub grace:            u32,
     pub heart:            u32,
     pub numen:            u32,
-    pub summoned:         String,
-    pub summoner:         String,
     pub personality:      String,
     pub backstory:        String,
     pub magical_affinity: String,
@@ -80,10 +78,8 @@ pub fn parse(content: &str) -> Result<SoulSeed, Box<dyn std::error::Error + Send
     Ok(SoulSeed {
         name:             get("name")?,
         vigor, wit, grace, heart, numen,
-        summoned:         fm.get("summoned").map(|s| s.trim().trim_matches('"').to_string()).unwrap_or_default(),
-        summoner:         fm.get("summoner").map(|s| s.trim().trim_matches('"').to_string()).unwrap_or_default(),
-        personality:      sections.get("Personality").cloned().unwrap_or_default(),
-        backstory:        sections.get("Backstory").cloned().unwrap_or_default(),
+        personality:  sections.get("Personality").cloned().unwrap_or_default(),
+        backstory:    sections.get("Backstory").cloned().unwrap_or_default(),
         magical_affinity: sections.get("Magical Affinity").cloned().unwrap_or_default(),
         self_declaration: sections.get("Self-Declaration").cloned().unwrap_or_default(),
     })

@@ -266,8 +266,8 @@ impl LlmBackend for MockBackend {
             return Ok(MOCK_NARRATIVES[idx].to_string());
         }
 
-        // Action prompt — 8% chance of cast_intent
-        if rng.gen_ratio(1, 12) {
+        // Action prompt — 25% chance of cast_intent
+        if rng.gen_ratio(1, 4) {
             let intent_idx = rng.gen_range(0..MOCK_INTENTS.len());
             let intent     = MOCK_INTENTS[intent_idx];
             warn!("MockBackend chose cast_intent");

@@ -15,7 +15,6 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct TimeConfig {
     pub ticks_per_day:    u32,
-    pub day_start_tick:   u32,
     pub night_start_tick: u32,
 }
 
@@ -70,7 +69,6 @@ pub struct ActionConfig {
     #[serde(default)] pub social_restore:          Option<f32>,
     #[serde(default)] pub hygiene_restore:         Option<f32>,
     #[serde(default)] pub dc:                      u32,
-    #[serde(default)] pub attribute:               Option<String>,
     #[serde(default)] pub duration_ticks:          Option<u32>,
     #[serde(default)] pub min_duration_ticks:      Option<u32>,
     #[serde(default)] pub max_duration_ticks:      Option<u32>,
@@ -80,9 +78,6 @@ pub struct ActionConfig {
 pub struct ResolutionConfig {
     pub crit_fail:      u32,
     pub crit_success:   u32,
-    pub dc_easy:        u32,
-    pub dc_medium:      u32,
-    pub dc_hard:        u32,
     pub night_dc_bonus: i32,
 }
 

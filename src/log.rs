@@ -1,6 +1,5 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write as IoWrite;
-use std::path::Path;
 
 use chrono::Local;
 use tracing::warn;
@@ -42,11 +41,6 @@ impl RunLog {
         }
     }
 
-    pub fn write_block(&self, lines: &[String]) {
-        for line in lines {
-            self.write_line(line);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

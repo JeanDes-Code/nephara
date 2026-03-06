@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::agent::{Attributes, NeedChanges, Needs};
-use crate::config::{ActionConfig, Config, ResolutionConfig};
+use crate::config::{ActionConfig, Config};
 
 // ---------------------------------------------------------------------------
 // Structured output schema builder
@@ -126,14 +126,9 @@ pub struct Resolution {
     pub dc:           u32,
     pub need_changes: NeedChanges,
     pub duration:     u32,
-    pub narrative:    String,
 }
 
 impl Resolution {
-    pub fn is_auto_success(cfg: &ActionConfig) -> bool {
-        cfg.dc == 0
-    }
-
     pub fn check_line(&self) -> String {
         if self.dc == 0 { return String::new(); }
         let attr = self.attribute_label();
@@ -202,7 +197,6 @@ pub fn resolve(
             roll: 0, modifier: 0, penalty: 0, total: 0, dc: 0,
             need_changes: base,
             duration,
-            narrative: auto_narrative(action),
         };
     }
 
@@ -234,7 +228,6 @@ pub fn resolve(
         roll, modifier, penalty, total, dc,
         need_changes,
         duration: 1,
-        narrative: String::new(), // filled by world/log layer
     }
 }
 
@@ -246,19 +239,6 @@ fn effective_dc(action: &Action, cfg: &ActionConfig, is_night: bool, config: &Co
         _ => 0,
     };
     base + night_bonus
-}
-
-fn auto_narrative(action: &Action) -> String {
-    match action {
-        Action::Eat   => "Takes a simple meal.".into(),
-        Action::Rest  => "Rests for a while.".into(),
-        Action::Sleep => "Falls into a deep sleep.".into(),
-        Action::Bathe => "Washes away the day's grime.".into(),
-        Action::Play  => "Plays lightheartedly.".into(),
-        Action::Move { destination } => format!("Moves to {}.", destination),
-        Action::Wander => "Wanders to an adjacent location.".into(),
-        _ => "Acts.".into(),
-    }
 }
 
 /// Returns (ActionConfig, attribute_name) for the given action.

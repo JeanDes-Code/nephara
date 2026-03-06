@@ -92,8 +92,9 @@ pub struct World {
     pub seed:           u64,
     pub config:         Config,
     pub run_log:        RunLog,
-    pub notable_events: Vec<(usize, String)>,
-    pub magic_count:    u32,
+    pub notable_events:      Vec<(usize, String)>,
+    pub magic_count:         u32,
+    pub magic_cast_this_day: Vec<bool>,
     grid:               [[TileType; GRID_W]; GRID_H],
     rng:                StdRng,
     llm:                Arc<dyn LlmBackend>,
@@ -125,6 +126,7 @@ impl World {
             run_log,
             notable_events: Vec::new(),
             magic_count: 0,
+            magic_cast_this_day: vec![false; seeds.len()],
             grid,
             rng,
             llm,
@@ -143,6 +145,8 @@ impl World {
         let tick_in_day = tick % tpd;
         let is_night    = tick_in_day >= self.config.time.night_start_tick;
         let tod         = runlog::time_of_day(tick_in_day, self.config.time.night_start_tick);
+
+        if tick_in_day == 0 { for flag in &mut self.magic_cast_this_day { *flag = false; } }
 
         // Randomise agent order each tick
         let mut order: Vec<usize> = (0..self.agents.len()).collect();
@@ -210,7 +214,7 @@ impl World {
             let schema = action::build_action_schema(&canonical_strs);
 
             // Build prompt and ask LLM
-            let prompt    = self.build_prompt(idx, tick, day, is_night, tod);
+            let prompt    = self.build_prompt(idx, tick, day, is_night, tod, self.magic_cast_this_day[idx]);
             let call_seed = Some(self.seed.wrapping_add(self.llm_call_counter));
             self.llm_call_counter += 1;
             let llm = Arc::clone(&self.llm);
@@ -580,6 +584,27 @@ impl World {
 
         self.agents[idx].needs.apply(&need_changes);
         self.magic_count += 1;
+        self.magic_cast_this_day[idx] = true;
+
+        // Ambient effect: nearby non-busy agents get a social+fun bonus
+        let ambient_fun    = (need_changes.fun.unwrap_or(0.0) * 0.5).min(8.0).max(0.0);
+        let ambient_social = 4.0_f32;
+        let ambient_touched = if ambient_fun > 0.0 || ambient_social > 0.0 {
+            let caster_pos = self.agents[idx].pos;
+            let caster_id  = self.agents[idx].id;
+            let nearby_ids: Vec<usize> = self.agents.iter()
+                .filter(|a| a.id != caster_id && Self::chebyshev_dist(a.pos, caster_pos) <= 1 && !a.is_busy())
+                .map(|a| a.id)
+                .collect();
+            let touched = !nearby_ids.is_empty();
+            for nid in nearby_ids {
+                self.agents[nid].needs.fun    = (self.agents[nid].needs.fun    + ambient_fun).min(100.0);
+                self.agents[nid].needs.social = (self.agents[nid].needs.social + ambient_social).min(100.0);
+            }
+            touched
+        } else {
+            false
+        };
 
         let ev = format!(
             "Day {day}: {} cast intent: \"{}\" → {}",
@@ -605,21 +630,22 @@ impl World {
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        let ambient_note = if ambient_touched { "\n(secondary effect touches those nearby)" } else { "" };
         let full_outcome = if interpreted.secondary_effect.is_empty() {
             if interp_note.is_empty() {
-                format!("{}\n{}", interpreted.primary_effect, meta)
+                format!("{}\n{}{}", interpreted.primary_effect, meta, ambient_note)
             } else {
-                format!("{}\n[read as: {}]\n{}", interpreted.primary_effect, interp_note, meta)
+                format!("{}\n[read as: {}]\n{}{}", interpreted.primary_effect, interp_note, meta, ambient_note)
             }
         } else if interp_note.is_empty() {
             format!(
-                "{}\n(secondary: {})\n{}",
-                interpreted.primary_effect, interpreted.secondary_effect, meta
+                "{}\n(secondary: {})\n{}{}",
+                interpreted.primary_effect, interpreted.secondary_effect, meta, ambient_note
             )
         } else {
             format!(
-                "{}\n[read as: {}]\n(secondary: {})\n{}",
-                interpreted.primary_effect, interp_note, interpreted.secondary_effect, meta
+                "{}\n[read as: {}]\n(secondary: {})\n{}{}",
+                interpreted.primary_effect, interp_note, interpreted.secondary_effect, meta, ambient_note
             )
         };
 
@@ -635,7 +661,7 @@ impl World {
     // Prompt builders
     // -----------------------------------------------------------------------
 
-    fn build_prompt(&self, idx: usize, tick: u32, day: u32, is_night: bool, tod: &str) -> String {
+    fn build_prompt(&self, idx: usize, tick: u32, day: u32, is_night: bool, tod: &str, magic_today: bool) -> String {
         let agent    = &self.agents[idx];
         let pos      = agent.pos;
         let tile     = self.tile_at(pos);
@@ -705,6 +731,12 @@ impl World {
             String::new()
         };
 
+        let magic_nudge = if !magic_today {
+            "\nMagic hasn't been spoken today. If anything stirs in you — a wish, a longing, a small hope — now is the time.\n".to_string()
+        } else {
+            String::new()
+        };
+
         format!(
             r#"You are {name}. {personality}
 
@@ -731,9 +763,10 @@ RECENT MEMORY (newest first):
 
 AVAILABLE ACTIONS:
 {actions}
-(You may also cast_intent — speak a desire upon reality. It will manifest,
-though perhaps not as you expect.)
 
+Magic is real and available to you at any time via cast_intent.
+Speak your desire and it will manifest — though words carry all their meanings.
+{magic_nudge}
 Avoid repeating the same action twice in a row. Your personality should guide what you do.
 
 Choose ONE action. Respond with ONLY a JSON object:
@@ -761,6 +794,7 @@ Choose ONE action. Respond with ONLY a JSON object:
             memory           = memory_block,
             last_action_note = last_action_note,
             actions          = actions_str,
+            magic_nudge      = magic_nudge,
         )
     }
 
@@ -889,6 +923,11 @@ Do not use quotation marks. Do not use names in the sentence. Just the summary."
                 }
             }
         }
+
+        // cast_intent: always available, hint based on Numen
+        let numen = self.agents[idx].attributes.numen;
+        let numen_hint = if numen >= 6 { " (strong affinity)" } else if numen >= 4 { "" } else { " (difficult)" };
+        v.push(format!("cast_intent — speak a desire upon reality, always succeeds{}", numen_hint));
 
         v
     }
