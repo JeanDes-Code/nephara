@@ -46,6 +46,8 @@ pub enum Action {
     Move { destination: String },
     CastIntent { intent: String },
     Pray { prayer: String },
+    Praise { praise_text: String },
+    Compose { haiku: String },
     ReadOracle,
     /// Fallback when requested action fails validation.
     Wander,
@@ -68,6 +70,8 @@ impl Action {
             Action::Move { .. } => "Move",
             Action::CastIntent { .. } => "Cast Intent",
             Action::Pray { .. }       => "Pray",
+            Action::Praise { .. }     => "Praise",
+            Action::Compose { .. }    => "Compose",
             Action::ReadOracle        => "Read Oracle",
             Action::Wander            => "Wander",
         }
@@ -79,6 +83,8 @@ impl Action {
             Action::Move { destination }       => format!("Move > {}", destination),
             Action::CastIntent { intent }      => format!("Cast Intent: \"{}\"", intent),
             Action::Pray { prayer }            => format!("Pray: \"{}\"", prayer),
+            Action::Praise { praise_text }     => format!("Praise: \"{}\"", praise_text),
+            Action::Compose { haiku }          => format!("Compose: \"{}\"", haiku),
             Action::ReadOracle                 => "Read Oracle".to_string(),
             other => other.name().to_string(),
         }
@@ -265,6 +271,8 @@ pub fn action_cfg_and_attr<'a>(action: &Action, config: &'a Config) -> (&'a Acti
         Action::Move { .. }      => (&config.actions.rest,        ""), // placeholder; move has no needs
         Action::CastIntent{ .. } => (&config.actions.cast_intent, "numen"),
         Action::Pray { .. }      => (&config.actions.pray,        ""),
+        Action::Praise { .. }    => (&config.actions.praise,      ""),
+        Action::Compose { .. }   => (&config.actions.compose,     ""),
         Action::ReadOracle       => (&config.actions.read_oracle,  ""),
         Action::Wander           => (&config.actions.rest,        ""),
     }
@@ -398,6 +406,14 @@ pub fn action_from_name(name: &str, target: Option<&str>, intent: Option<&str>) 
         "pray" => {
             let p = intent.unwrap_or("I offer this moment in stillness").to_string();
             Action::Pray { prayer: p }
+        }
+        "praise" => {
+            let p = intent.unwrap_or("I offer gratitude for this world").to_string();
+            Action::Praise { praise_text: p }
+        }
+        "compose" => {
+            let h = intent.unwrap_or("silence / between two thoughts / the world breathes").to_string();
+            Action::Compose { haiku: h }
         }
         "read oracle" | "read_oracle" => Action::ReadOracle,
         other => {

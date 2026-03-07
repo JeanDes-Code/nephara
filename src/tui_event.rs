@@ -59,6 +59,11 @@ pub enum TuiEvent {
         notable_events: Vec<String>,
     },
     SimulationError(String),
+    /// Streaming token from the current LLM call for `agent_id`.
+    PartialToken {
+        agent_id: usize,
+        token:    String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +82,8 @@ pub struct TickEntrySnapshot {
     pub outcome_tier_label: Option<String>,
     /// Text extracted from `Pray: "..."` action lines.
     pub prayer_text:        Option<String>,
+    /// Total LLM time in milliseconds for this agent's turn.
+    pub llm_duration_ms:    Option<u64>,
 }
 
 #[derive(Clone)]

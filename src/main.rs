@@ -168,6 +168,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 cfg.llm.model.clone(),
                 cfg.llm.temperature,
                 cfg.llm.think,
+                cfg.llm.thinking_budget_chars,
             );
             if let Err(e) = ollama.health_check().await {
                 error!("{}", e);
@@ -184,7 +185,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Some(model) => {
                 let smart_url = cfg.llm.smart_ollama_url.clone()
                     .unwrap_or_else(|| cfg.llm.ollama_url.clone());
-                let smart = OllamaBackend::new(smart_url, model.clone(), cfg.llm.temperature, cfg.llm.think);
+                let smart = OllamaBackend::new(smart_url, model.clone(), cfg.llm.temperature, cfg.llm.think, cfg.llm.thinking_budget_chars);
                 match smart.health_check().await {
                     Ok(_)  => {
                         info!("Smart model '{}' available for planning/reflection/desires", model);
@@ -270,9 +271,13 @@ async fn run_tui(
 
     let agent_count   = world.agents.len();
     let backend_owned = backend_name.to_string();
+    let model_owned   = world.config.llm.model.clone();
     let souls_owned   = souls_dir.to_string();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<tui_event::TuiEvent>(512);
+
+    // Wire up TUI streaming (FEAT-13)
+    world.tui_tx = Some(tx.clone());
 
     // Spawn simulation
     let sim_handle = tokio::spawn(sim_runner::run_simulation(
@@ -281,7 +286,7 @@ async fn run_tui(
 
     // Run TUI in a blocking thread (crossterm needs blocking I/O)
     let tui_handle = tokio::task::spawn_blocking(move || {
-        let mut app = tui::TuiApp::new(agent_count, total_ticks, seed, backend_owned, roster);
+        let mut app = tui::TuiApp::new(agent_count, total_ticks, seed, backend_owned, model_owned, roster);
         app.run(rx)
     });
 
@@ -309,6 +314,9 @@ async fn run_streaming(
     souls_dir:    &str,
     cfg:          &config::Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Enable token streaming to stdout (FEAT-13)
+    world.token_echo = true;
+
     // Print banner
     world.run_log.write_line(&format!(
         "Nephara — seed:{} | {} ticks | backend:{}",
@@ -318,6 +326,11 @@ async fn run_streaming(
         "Agents: {}",
         world.agents.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")
     ));
+
+    let initial_needs: Vec<(String, crate::agent::Needs)> = world.agents.iter()
+        .map(|a| (a.name().to_string(), a.needs.clone()))
+        .collect();
+    let run_start = std::time::Instant::now();
 
     for _t in 0..total_ticks {
         let result = world.tick().await?;
@@ -373,6 +386,20 @@ async fn run_streaming(
         world.magic_count,
         &all_notable,
         seed,
+    );
+
+    // Post-run summary markdown (FEAT-11)
+    let run_duration_ms = run_start.elapsed().as_millis() as u64;
+    log::write_run_summary(
+        &world.run_log.run_id,
+        seed,
+        total_ticks,
+        &world.agents,
+        &initial_needs,
+        world.magic_count,
+        &all_notable,
+        run_duration_ms,
+        world.is_test_run,
     );
 
     info!("Simulation complete. Seed: {}", seed);

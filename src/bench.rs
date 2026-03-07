@@ -82,7 +82,7 @@ pub async fn run_bench(
 
     for model in &config.models {
         println!("── {} ──", model);
-        let backend = OllamaBackend::new(config.ollama_url.clone(), model.clone(), 0.7, None);
+        let backend = OllamaBackend::new(config.ollama_url.clone(), model.clone(), 0.7, None, None);
 
         let action_res = bench_prompt_type(
             &backend, ACTION_PROMPT, 150, Some(&action_schema), config.samples, "action",
@@ -151,7 +151,7 @@ async fn bench_prompt_type(
 
     for _ in 0..samples {
         let start  = Instant::now();
-        let result = backend.generate(prompt, max_tokens, None, schema).await;
+        let result = backend.generate(prompt, max_tokens, None, schema, None).await;
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         total_ms += elapsed;
 

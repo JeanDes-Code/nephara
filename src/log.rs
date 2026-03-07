@@ -84,9 +84,10 @@ impl RunLog {
 // Tick header
 // ---------------------------------------------------------------------------
 
+// FEAT-7: blank separator line after the header for readability.
 pub fn tick_header(tick: u32, day: u32, time_of_day: &str) -> String {
     let s = format!("\n=== TICK {} | Day {} | {} ===", tick, day, time_of_day);
-    format!("{}", s.color(colored::Color::BrightBlue).bold())
+    format!("{}\n", s.color(colored::Color::BrightBlue).bold())
 }
 
 pub fn time_of_day(tick_in_day: u32, night_start: u32) -> &'static str {
@@ -138,6 +139,8 @@ pub struct TickEntry {
     pub outcome_line:       String,
     /// The outcome tier label (e.g. "Success"), present only when a d20 check was made.
     pub outcome_tier_label: Option<String>,
+    /// Total LLM time for this agent's turn in milliseconds.
+    pub llm_duration_ms:    Option<u64>,
 }
 
 impl TickEntry {
@@ -166,8 +169,13 @@ impl TickEntry {
             self.action_line.clone()
         };
 
-        let header = format!("  [{}] @ {} {} | {}",
-            colored_name, colored_loc, pos_str, colored_action_line);
+        let timing_suffix = match self.llm_duration_ms {
+            Some(ms) if ms > 0 => format!(" ({}ms)", ms),
+            _ => String::new(),
+        };
+
+        let header = format!("  [{}] @ {} {} | {}{}",
+            colored_name, colored_loc, pos_str, colored_action_line, timing_suffix);
         let mut lines = vec![header];
 
         if self.outcome_line.is_empty() {
@@ -277,13 +285,74 @@ pub fn append_wishes(souls_dir: &str, agent_name: &str, header: &str, content: &
 // Prayer persistence
 // ---------------------------------------------------------------------------
 
-pub fn append_prayer(souls_dir: &str, agent_name: &str, header: &str, content: &str) {
+// FEAT-8: Richer headers with run_id, day, tick, tod.
+pub fn append_prayer(
+    souls_dir:  &str,
+    agent_name: &str,
+    run_id:     &str,
+    day:        u32,
+    tick:       u32,
+    tod:        &str,
+    content:    &str,
+) {
     let path  = format!("{}/{}.prayers.md", souls_dir, agent_name.to_lowercase());
+    let date  = Local::now().format("%Y-%m-%d");
+    let header = format!("## Run {} | Day {} | Tick {} | {} | {}", run_id, day, tick, tod, date);
     let entry = format!("\n{}\n{}\n", header, content);
     let file  = OpenOptions::new().create(true).append(true).open(&path);
     match file {
         Ok(mut f) => { let _ = f.write_all(entry.as_bytes()); }
         Err(e)    => warn!("Could not append prayer for {}: {}", agent_name, e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Praise persistence (FEAT-15)
+// ---------------------------------------------------------------------------
+
+pub fn append_praise(
+    souls_dir:  &str,
+    agent_name: &str,
+    run_id:     &str,
+    day:        u32,
+    tick:       u32,
+    tod:        &str,
+    content:    &str,
+) {
+    let path  = format!("{}/{}.praises.md", souls_dir, agent_name.to_lowercase());
+    let date  = Local::now().format("%Y-%m-%d");
+    let header = format!("## Run {} | Day {} | Tick {} | {} | {}", run_id, day, tick, tod, date);
+    let entry = format!("\n{}\n{}\n", header, content);
+    let file  = OpenOptions::new().create(true).append(true).open(&path);
+    match file {
+        Ok(mut f) => { let _ = f.write_all(entry.as_bytes()); }
+        Err(e)    => warn!("Could not append praise for {}: {}", agent_name, e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Haiku persistence (FEAT-16)
+// ---------------------------------------------------------------------------
+
+pub fn append_haiku(
+    souls_dir:  &str,
+    agent_name: &str,
+    run_id:     &str,
+    day:        u32,
+    tick:       u32,
+    tod:        &str,
+    haiku:      &str,
+    score:      u32,
+    verdict:    &str,
+) {
+    let path  = format!("{}/{}.haikus.md", souls_dir, agent_name.to_lowercase());
+    let date  = Local::now().format("%Y-%m-%d");
+    let header = format!("## Run {} | Day {} | Tick {} | {} | {} | Score: {}", run_id, day, tick, tod, date, score);
+    let entry = format!("\n{}\n{}\n\n*{}*\n", header, haiku, verdict);
+    let file  = OpenOptions::new().create(true).append(true).open(&path);
+    match file {
+        Ok(mut f) => { let _ = f.write_all(entry.as_bytes()); }
+        Err(e)    => warn!("Could not append haiku for {}: {}", agent_name, e),
     }
 }
 
@@ -296,11 +365,12 @@ pub fn load_oracle_response(souls_dir: &str, agent_name: &str) -> String {
     fs::read_to_string(&path).unwrap_or_default()
 }
 
-pub fn archive_oracle_response(souls_dir: &str, agent_name: &str, content: &str) {
+// FEAT-8: Richer header with run_id and day.
+pub fn archive_oracle_response(souls_dir: &str, agent_name: &str, run_id: &str, day: u32, content: &str) {
     // Append to history
     let history_path = format!("{}/{}.oracle_history.md", souls_dir, agent_name.to_lowercase());
     let date  = Local::now().format("%Y-%m-%d");
-    let entry = format!("\n## {} — {}\n{}\n", agent_name, date, content);
+    let entry = format!("\n## {} | Run {} | Day {} — {}\n{}\n", agent_name, run_id, day, date, content);
     let file  = OpenOptions::new().create(true).append(true).open(&history_path);
     match file {
         Ok(mut f) => { let _ = f.write_all(entry.as_bytes()); }
@@ -384,7 +454,7 @@ pub fn append_journal(
 }
 
 // ---------------------------------------------------------------------------
-// Run summary
+// Run summary (terminal output)
 // ---------------------------------------------------------------------------
 
 pub fn print_run_summary(
@@ -411,4 +481,67 @@ pub fn print_run_summary(
         }
     }
     log.write_line("=".repeat(60).as_str());
+}
+
+// ---------------------------------------------------------------------------
+// Post-run summary file (FEAT-11)
+// ---------------------------------------------------------------------------
+
+pub fn write_run_summary(
+    run_id:         &str,
+    seed:           u64,
+    total_ticks:    u32,
+    agents:         &[Agent],
+    initial_needs:  &[(String, crate::agent::Needs)],
+    magic_count:    u32,
+    notable_events: &[String],
+    run_duration_ms: u64,
+    is_test_run:    bool,
+) {
+    if is_test_run { return; }
+
+    let days    = total_ticks / 48;
+    let date    = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let dir     = format!("runs/{}", run_id);
+    let path    = format!("{}/summary.md", dir);
+
+    let mut body = format!(
+        "# Run {} Summary\n\nGenerated: {}\n\n## Overview\n- Seed: {}\n- Duration: {} ticks / {} day{}\n- Agents: {}\n- Magic spells cast: {}\n- Wall time: {:.1}s\n\n",
+        run_id, date,
+        seed,
+        total_ticks, days, if days == 1 { "" } else { "s" },
+        agents.len(),
+        magic_count,
+        run_duration_ms as f64 / 1000.0,
+    );
+
+    body.push_str("## Agent Summaries\n");
+    for agent in agents {
+        let name = agent.name();
+        body.push_str(&format!("\n### {}\n", name));
+        body.push_str(&format!("- Final needs: Satiety:{:.0} Energy:{:.0} Fun:{:.0} Social:{:.0} Hygiene:{:.0}\n",
+            agent.needs.hunger, agent.needs.energy, agent.needs.fun, agent.needs.social, agent.needs.hygiene));
+        if let Some((_, init)) = initial_needs.iter().find(|(n, _)| n == name) {
+            body.push_str(&format!("- Net changes: Satiety:{:+.0} Energy:{:+.0} Fun:{:+.0} Social:{:+.0} Hygiene:{:+.0}\n",
+                agent.needs.hunger - init.hunger,
+                agent.needs.energy - init.energy,
+                agent.needs.fun    - init.fun,
+                agent.needs.social - init.social,
+                agent.needs.hygiene - init.hygiene,
+            ));
+        }
+    }
+
+    if !notable_events.is_empty() {
+        body.push_str("\n## Notable Events\n");
+        for ev in notable_events {
+            body.push_str(&format!("- {}\n", ev));
+        }
+    } else {
+        body.push_str("\n## Notable Events\nA quiet run.\n");
+    }
+
+    if let Err(e) = fs::write(&path, body) {
+        warn!("Could not write run summary to {}: {}", path, e);
+    }
 }

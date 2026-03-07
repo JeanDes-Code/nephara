@@ -1,3 +1,4 @@
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -43,6 +44,12 @@ pub async fn run_simulation(
         "Agents: {}",
         world.agents.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")
     ));
+
+    // Capture initial needs for the post-run summary (FEAT-11)
+    let initial_needs: Vec<(String, crate::agent::Needs)> = world.agents.iter()
+        .map(|a| (a.name().to_string(), a.needs.clone()))
+        .collect();
+    let run_start = Instant::now();
 
     for _t in 0..total_ticks {
         let tick_num = world.tick_num;
@@ -106,6 +113,7 @@ pub async fn run_simulation(
                 outcome_line:       entry.outcome_line.clone(),
                 outcome_tier_label: entry.outcome_tier_label.clone(),
                 prayer_text,
+                llm_duration_ms:    entry.llm_duration_ms,
             };
             let _ = tx.send(TuiEvent::AgentAction(snapshot)).await;
         }
@@ -165,6 +173,20 @@ pub async fn run_simulation(
         world.magic_count,
         &all_notable,
         seed,
+    );
+
+    // Post-run summary markdown (FEAT-11)
+    let run_duration_ms = run_start.elapsed().as_millis() as u64;
+    runlog::write_run_summary(
+        &world.run_log.run_id,
+        seed,
+        total_ticks,
+        &world.agents,
+        &initial_needs,
+        world.magic_count,
+        &all_notable,
+        run_duration_ms,
+        world.is_test_run,
     );
 
     // Send completion event

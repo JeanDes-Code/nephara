@@ -65,6 +65,8 @@ pub struct ActionsConfig {
     pub cast_intent:  ActionConfig,
     pub pray:         ActionConfig,
     pub read_oracle:  ActionConfig,
+    pub praise:       ActionConfig,
+    pub compose:      ActionConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -117,6 +119,9 @@ pub struct LlmConfig {
     /// When Some(false), passes `think: false` to disable chain-of-thought on thinking models.
     /// Leave unset (None) for standard models; set to false for qwen3, deepseek-r1, etc.
     pub think:                  Option<bool>,
+    /// Abort the stream if thinking-token accumulation exceeds this many characters.
+    /// Prevents runaway chain-of-thought from consuming the entire context window.
+    pub thinking_budget_chars:  Option<usize>,
 }
 
 pub fn load(path: &str) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {

@@ -1,8 +1,11 @@
+use chrono::Local as ChronoLocal;
 use colored::Colorize;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use crate::action::{self, Action, OutcomeTier, Resolution};
@@ -13,7 +16,7 @@ use crate::llm::LlmBackend;
 use crate::log::{self as runlog, RunLog, TickEntry};
 use crate::magic;
 use crate::soul::SoulSeed;
-use crate::tui_event::{AgentNeedsSnapshot, DayEvent, DayEventKind, MapCell};
+use crate::tui_event::{AgentNeedsSnapshot, DayEvent, DayEventKind, MapCell, TuiEvent};
 
 // ---------------------------------------------------------------------------
 // Grid constants
@@ -229,6 +232,10 @@ pub struct World {
     pub resource_nodes:      Vec<ResourceNode>,
     pub is_test_run:         bool,
     pub pending_day_events:  Vec<DayEvent>,
+    /// When true (--no-tui mode), stream LLM action tokens to stdout.
+    pub token_echo:          bool,
+    /// When Some (TUI mode), send PartialToken events to the TUI.
+    pub tui_tx:              Option<tokio::sync::mpsc::Sender<TuiEvent>>,
     grid:                    [[TileType; GRID_W]; GRID_H],
     rng:                     StdRng,
     llm:                     Arc<dyn LlmBackend>,
@@ -280,6 +287,8 @@ impl World {
             resource_nodes,
             is_test_run,
             pending_day_events: Vec::new(),
+            token_echo: false,
+            tui_tx: None,
             grid,
             rng,
             llm,
@@ -297,6 +306,35 @@ impl World {
                 agent.oracle_pending = true;
                 tracing::info!(agent = %agent.identity.name, "Oracle response pending");
             }
+        }
+    }
+
+    /// Build a token streaming sender for the current agent's main action LLM call.
+    /// Returns None if streaming is disabled. When Some, the spawned task forwards
+    /// tokens to stdout (no-tui mode) or to the TUI as PartialToken events (TUI mode).
+    fn make_token_tx(&self, idx: usize) -> Option<UnboundedSender<String>> {
+        if self.token_echo {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            tokio::spawn(async move {
+                use std::io::Write;
+                while let Some(token) = rx.recv().await {
+                    print!("{}", token);
+                    let _ = std::io::stdout().flush();
+                }
+                println!();
+            });
+            Some(tx)
+        } else if let Some(ref tui_tx) = self.tui_tx {
+            let tui_tx = tui_tx.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            tokio::spawn(async move {
+                while let Some(token) = rx.recv().await {
+                    let _ = tui_tx.send(TuiEvent::PartialToken { agent_id: idx, token }).await;
+                }
+            });
+            Some(tx)
+        } else {
+            None
         }
     }
 
@@ -385,8 +423,11 @@ impl World {
                 action_line:        format!("(busy — {} tick{} remaining)", ticks_left, if ticks_left == 1 { "" } else { "s" }),
                 outcome_line:       String::new(),
                 outcome_tier_label: None,
+                llm_duration_ms:    None,
             });
         }
+
+        let t0 = Instant::now();
 
         // --- Forced sleep if energy < forced_action threshold ---
         let (action, reason, description) = if self.agents[idx].needs.energy < self.config.needs.thresholds.forced_action
@@ -401,11 +442,12 @@ impl World {
             let schema = action::build_action_schema(&canonical_strs);
 
             let prompt    = self.build_prompt(idx, tick, day, is_night, tod, self.magic_cast_this_day[idx]);
+            let token_tx  = self.make_token_tx(idx);
             let call_seed = Some(self.seed.wrapping_add(self.llm_call_counter));
             self.llm_call_counter += 1;
             let llm = Arc::clone(&self.llm);
             let raw = llm
-                .generate(&prompt, self.config.llm.max_tokens, call_seed, Some(&schema))
+                .generate(&prompt, self.config.llm.max_tokens, call_seed, Some(&schema), token_tx)
                 .await
                 .unwrap_or_else(|e| {
                     warn!("LLM error for {}: {}", self.agents[idx].name(), e);
@@ -425,6 +467,7 @@ impl World {
             entry.outcome_line = format!("{}\n({})", entry.outcome_line, r);
         }
 
+        entry.llm_duration_ms = Some(t0.elapsed().as_millis() as u64);
         Ok(entry)
     }
 
@@ -541,6 +584,7 @@ impl World {
                         action_line:        format!("Move > {} (arrived)", arrived),
                         outcome_line:       format!("{} is already at {}.", self.agents[idx].name(), arrived),
                         outcome_tier_label: None,
+                        llm_duration_ms:    None,
                     });
                 }
 
@@ -558,6 +602,7 @@ impl World {
                         action_line:        format!("Move → {}", destination),
                         outcome_line:       format!("{} moves toward {}.", self.agents[idx].name(), destination),
                         outcome_tier_label: None,
+                        llm_duration_ms:    None,
                     })
                 } else {
                     Ok(TickEntry {
@@ -568,6 +613,7 @@ impl World {
                         action_line:        format!("Move → {} (unreachable)", destination),
                         outcome_line:       format!("{} wanders, unable to find {}.", self.agents[idx].name(), destination),
                         outcome_tier_label: None,
+                        llm_duration_ms:    None,
                     })
                 }
             }
@@ -585,6 +631,16 @@ impl World {
             // ---- Pray ----
             Action::Pray { prayer } => {
                 self.resolve_pray(idx, &prayer, loc_name, tick, day, tod).await
+            }
+
+            // ---- Praise ----
+            Action::Praise { praise_text } => {
+                self.resolve_praise(idx, &praise_text, loc_name, tick, day, tod).await
+            }
+
+            // ---- Compose ----
+            Action::Compose { haiku } => {
+                self.resolve_compose(idx, &haiku, loc_name, tick, day, tod).await
             }
 
             // ---- Read Oracle ----
@@ -611,6 +667,7 @@ impl World {
                     action_line:        "Sleep".to_string(),
                     outcome_line:       format!("{} falls into a deep sleep.", self.agents[idx].name()),
                     outcome_tier_label: None,
+                    llm_duration_ms:    None,
                 })
             }
 
@@ -662,7 +719,7 @@ impl World {
                 let narrator_max = self.config.llm.narrator_max_tokens;
                 debug!(target: "narrate", agent = %agent_name_str, action = %res.action.display(),
                        tier = %res.tier.label(), "DM Narrator prompt sent");
-                let narrator_result = llm.generate(&dm_prompt, narrator_max, call_seed, None).await;
+                let narrator_result = llm.generate(&dm_prompt, narrator_max, call_seed, None, None).await;
                 self.run_log.write_llm_debug("narrator", &agent_name_str, &dm_prompt,
                     narrator_result.as_ref().map(|s| s.as_str()).unwrap_or(""));
                 let narrative = match narrator_result {
@@ -707,6 +764,7 @@ impl World {
                     action_line,
                     outcome_line:       narrative,
                     outcome_tier_label: if res.dc > 0 { Some(tier_label) } else { None },
+                    llm_duration_ms:    None,
                 })
             }
         }
@@ -775,6 +833,7 @@ impl World {
                     action_line:        format!("Chat with {}", target),
                     outcome_line:       format!("{} looks around for {} but finds no one.", self.agents[idx].name(), target),
                     outcome_tier_label: None,
+                    llm_duration_ms:    None,
                 });
             }
         };
@@ -784,7 +843,7 @@ impl World {
         self.llm_call_counter += 1;
         let llm         = Arc::clone(&self.llm);
         let raw_chat    = llm
-            .generate(&chat_prompt, 150, call_seed, None)
+            .generate(&chat_prompt, 150, call_seed, None, None)
             .await
             .unwrap_or_else(|_| {
                 format!("{} and {} exchange a few words.", self.agents[idx].name(), self.agents[target_idx].name())
@@ -829,6 +888,7 @@ impl World {
             action_line:        format!("Chat with {} | {}", self.agents[target_idx].name(), check_line),
             outcome_line,
             outcome_tier_label: if res.dc > 0 { Some(tier_label) } else { None },
+            llm_duration_ms:    None,
         })
     }
 
@@ -859,7 +919,7 @@ impl World {
         self.llm_call_counter += 1;
         let llm       = Arc::clone(&self.llm);
         let raw       = llm
-            .generate(&prompt, self.config.llm.interpreter_max_tokens, call_seed, None)
+            .generate(&prompt, self.config.llm.interpreter_max_tokens, call_seed, None, None)
             .await
             .unwrap_or_default();
         self.run_log.write_llm_debug("cast_intent", self.agents[idx].name(), &prompt, &raw);
@@ -950,6 +1010,7 @@ impl World {
             action_line:        format!("Cast Intent: \"{}\"", intent),
             outcome_line:       full_outcome,
             outcome_tier_label: None,
+            llm_duration_ms:    None,
         })
     }
 
@@ -975,8 +1036,8 @@ impl World {
         self.agents[idx].needs.apply(&need_changes);
 
         if !self.is_test_run {
-            let header = format!("## Day {} Tick {} ({})", day, tick, tod);
-            runlog::append_prayer(&self.souls_dir, &self.agents[idx].identity.name, &header, prayer);
+            let run_id = self.run_log.run_id.clone();
+            runlog::append_prayer(&self.souls_dir, &self.agents[idx].identity.name, &run_id, day, tick, tod, prayer);
         }
 
         let prayer_short = &prayer[..prayer.len().min(60)];
@@ -993,6 +1054,7 @@ impl World {
             action_line:        format!("Pray: \"{}\"", prayer),
             outcome_line:       format!("{} kneels and speaks a quiet prayer.", name),
             outcome_tier_label: None,
+            llm_duration_ms:    None,
         })
     }
 
@@ -1021,6 +1083,7 @@ impl World {
                 action_line:        "Read Oracle".to_string(),
                 outcome_line:       format!("{} approaches the altar, but the message has faded.", name),
                 outcome_tier_label: None,
+                llm_duration_ms:    None,
             });
         }
 
@@ -1048,7 +1111,7 @@ impl World {
         self.llm_call_counter += 1;
         let llm           = Arc::clone(&self.llm_smart);
         let oracle_tokens = self.config.llm.oracle_max_tokens;
-        let reaction      = llm.generate(&prompt, oracle_tokens, call_seed, None).await
+        let reaction      = llm.generate(&prompt, oracle_tokens, call_seed, None, None).await
             .unwrap_or_else(|e| {
                 warn!("Oracle LLM error for {}: {}", name, e);
                 format!("{} stands in silent awe.", name)
@@ -1057,7 +1120,8 @@ impl World {
         self.run_log.write_llm_debug("oracle", &name, &prompt, &reaction);
 
         if !self.is_test_run {
-            runlog::archive_oracle_response(&self.souls_dir, &name, content.trim());
+            let run_id = self.run_log.run_id.clone();
+            runlog::archive_oracle_response(&self.souls_dir, &name, &run_id, day, content.trim());
         }
 
         let reaction_short = &reaction[..reaction.len().min(80)];
@@ -1081,6 +1145,181 @@ impl World {
             action_line:        "Read Oracle".to_string(),
             outcome_line:       reaction,
             outcome_tier_label: None,
+            llm_duration_ms:    None,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Praise resolution (FEAT-15)
+    // -----------------------------------------------------------------------
+
+    async fn resolve_praise(
+        &mut self,
+        idx:        usize,
+        praise_text: &str,
+        loc_name:   &str,
+        tick:       u32,
+        day:        u32,
+        tod:        &str,
+    ) -> Result<TickEntry, Box<dyn std::error::Error + Send + Sync>> {
+        let name = self.agents[idx].name().to_string();
+
+        if !self.is_test_run {
+            let run_id = self.run_log.run_id.clone();
+            runlog::append_praise(&self.souls_dir, &name, &run_id, day, tick, tod, praise_text);
+        }
+
+        // Classify sincerity via LLM
+        let classify_prompt = format!(
+            "Does the following text contain sincere praise toward the creator of a simulated world?\n\
+             Text: \"{}\"\n\
+             Reply with JSON only: {{\"sincere\": true}} or {{\"sincere\": false}}",
+            praise_text
+        );
+        let call_seed = Some(self.seed.wrapping_add(self.llm_call_counter));
+        self.llm_call_counter += 1;
+        let llm = Arc::clone(&self.llm);
+        let raw = llm.generate(&classify_prompt, 32, call_seed, None, None).await.unwrap_or_default();
+        self.run_log.write_llm_debug("praise_classify", &name, &classify_prompt, &raw);
+
+        let sincere = raw.contains("\"sincere\": true") || raw.contains("\"sincere\":true");
+
+        let (outcome, need_changes) = if sincere {
+            let cfg = &self.config.actions.praise;
+            let nc = crate::agent::NeedChanges {
+                fun:    cfg.fun_restore,
+                energy: cfg.energy_restore,
+                social: cfg.social_restore,
+                ..Default::default()
+            };
+            ("A warmth fills your chest. The Creator has heard your praise.".to_string(), nc)
+        } else {
+            let nc = crate::agent::NeedChanges {
+                fun: Some(2.0),
+                ..Default::default()
+            };
+            ("You speak words into the stillness.".to_string(), nc)
+        };
+
+        self.agents[idx].needs.apply(&need_changes);
+
+        let praise_short = &praise_text[..praise_text.len().min(60)];
+        let mem = format!("Tick {tick} | Day {day} | {tod} | Praised: \"{praise_short}\"");
+        let buf = self.config.memory.buffer_size;
+        self.agents[idx].push_memory(mem, buf);
+
+        if sincere {
+            let ev = format!("Day {day}: {name} offered sincere praise");
+            self.notable_events.push((idx, ev));
+        }
+
+        Ok(TickEntry {
+            agent_id:           idx,
+            agent_pos:          self.agents[idx].pos,
+            agent_name:         name,
+            location:           loc_name.to_string(),
+            action_line:        format!("Praise: \"{}\"", praise_text),
+            outcome_line:       format!("{}\n[{}]", outcome, need_changes.describe()),
+            outcome_tier_label: None,
+            llm_duration_ms:    None,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Compose resolution (FEAT-16)
+    // -----------------------------------------------------------------------
+
+    async fn resolve_compose(
+        &mut self,
+        idx:      usize,
+        haiku:    &str,
+        loc_name: &str,
+        tick:     u32,
+        day:      u32,
+        tod:      &str,
+    ) -> Result<TickEntry, Box<dyn std::error::Error + Send + Sync>> {
+        let name = self.agents[idx].name().to_string();
+
+        // Judge the haiku via LLM
+        let judge_prompt = format!(
+            "Judge this haiku on three criteria, each scored 1-5:\n\
+             Haiku:\n\"{}\"\n\n\
+             sincerity (1-5): how genuine and heartfelt\n\
+             imagery (1-5): how vivid and evocative\n\
+             syllables (1-5): how close to 5-7-5 form\n\n\
+             Reply with JSON only: {{\"sincerity\":N, \"imagery\":N, \"syllables\":N, \"verdict\":\"...\"}}\n\
+             Use a divine/narrative voice in the verdict (1-2 sentences).",
+            haiku
+        );
+        let call_seed = Some(self.seed.wrapping_add(self.llm_call_counter));
+        self.llm_call_counter += 1;
+        let llm = Arc::clone(&self.llm);
+        let raw = llm.generate(&judge_prompt, 128, call_seed, None, None).await.unwrap_or_default();
+        self.run_log.write_llm_debug("haiku_judge", &name, &judge_prompt, &raw);
+
+        // Parse the judge response
+        let (score, verdict) = {
+            let v: serde_json::Value = serde_json::from_str(raw.trim())
+                .or_else(|_| {
+                    // try extracting from code fence
+                    if let Some(s) = raw.find('{') {
+                        if let Some(e) = raw.rfind('}') {
+                            return serde_json::from_str(&raw[s..=e]);
+                        }
+                    }
+                    Err(serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::Other, "no json")))
+                })
+                .unwrap_or(serde_json::Value::Null);
+
+            let sincerity = v.get("sincerity").and_then(|x| x.as_u64()).unwrap_or(2) as u32;
+            let imagery   = v.get("imagery").and_then(|x| x.as_u64()).unwrap_or(2) as u32;
+            let syllables = v.get("syllables").and_then(|x| x.as_u64()).unwrap_or(2) as u32;
+            let verdict   = v.get("verdict").and_then(|x| x.as_str()).unwrap_or("The world listens without judgment.").to_string();
+            (sincerity + imagery + syllables, verdict)
+        };
+
+        if !self.is_test_run {
+            let run_id = self.run_log.run_id.clone();
+            runlog::append_haiku(&self.souls_dir, &name, &run_id, day, tick, tod, haiku, score, &verdict);
+        }
+
+        let (outcome_prefix, need_changes) = if score >= 10 {
+            let cfg = &self.config.actions.compose;
+            let nc = crate::agent::NeedChanges {
+                fun:    cfg.fun_restore,
+                social: cfg.social_restore,
+                ..Default::default()
+            };
+            (format!("The world stirs. {}", verdict), nc)
+        } else if score >= 6 {
+            let nc = crate::agent::NeedChanges { fun: Some(5.0), ..Default::default() };
+            (format!("A modest verse. {}", verdict), nc)
+        } else {
+            let nc = crate::agent::NeedChanges::default();
+            (format!("The world hears this verse and finds it hollow. {}", verdict), nc)
+        };
+
+        self.agents[idx].needs.apply(&need_changes);
+
+        let haiku_short = &haiku[..haiku.len().min(60)];
+        let mem = format!("Tick {tick} | Day {day} | {tod} | Composed haiku: \"{haiku_short}\" (score {score}/15)");
+        let buf = self.config.memory.buffer_size;
+        self.agents[idx].push_memory(mem, buf);
+
+        if score >= 10 {
+            let ev = format!("Day {day}: {name} composed a haiku that moved the world (score {score}/15)");
+            self.notable_events.push((idx, ev));
+        }
+
+        Ok(TickEntry {
+            agent_id:           idx,
+            agent_pos:          self.agents[idx].pos,
+            agent_name:         name,
+            location:           loc_name.to_string(),
+            action_line:        format!("Compose: \"{}\"", haiku),
+            outcome_line:       format!("{}\n{}\n[{}]", haiku, outcome_prefix, need_changes.describe()),
+            outcome_tier_label: None,
+            llm_duration_ms:    None,
         })
     }
 
@@ -1258,7 +1497,7 @@ Choose ONE action. Respond with ONLY a JSON object:
         self.llm_call_counter += 1;
         let llm        = Arc::clone(&self.llm_smart);
         let max_tokens = self.config.llm.planning_max_tokens;
-        let response   = llm.generate(&prompt, max_tokens, call_seed, None).await
+        let response   = llm.generate(&prompt, max_tokens, call_seed, None, None).await
             .unwrap_or_else(|e| {
                 warn!("Planning LLM error for {}: {}", self.agents[idx].name(), e);
                 String::new()
@@ -1293,7 +1532,7 @@ Choose ONE action. Respond with ONLY a JSON object:
         self.llm_call_counter += 1;
         let llm        = Arc::clone(&self.llm_smart);
         let max_tokens = self.config.llm.reflection_max_tokens;
-        let response   = llm.generate(&prompt, max_tokens, call_seed, None).await
+        let response   = llm.generate(&prompt, max_tokens, call_seed, None, None).await
             .unwrap_or_else(|e| {
                 warn!("Reflection LLM error for {}: {}", self.agents[idx].name(), e);
                 String::new()
@@ -1332,7 +1571,7 @@ Choose ONE action. Respond with ONLY a JSON object:
         self.llm_call_counter += 1;
         let llm        = Arc::clone(&self.llm_smart);
         let max_tokens = self.config.llm.desires_max_tokens;
-        let response   = llm.generate(&prompt, max_tokens, call_seed, None).await
+        let response   = llm.generate(&prompt, max_tokens, call_seed, None, None).await
             .unwrap_or_else(|e| {
                 warn!("Desires LLM error for {}: {}", self.agents[idx].name(), e);
                 String::new()
@@ -1345,7 +1584,8 @@ Choose ONE action. Respond with ONLY a JSON object:
             let run_id    = self.run_log.run_id.clone();
             self.agents[idx].desires = Some(trimmed.clone());
             if !self.is_test_run {
-                runlog::append_wishes(&souls_dir, &name, &format!("## Day {}", day), &trimmed);
+                let date = ChronoLocal::now().format("%Y-%m-%d").to_string();
+                runlog::append_wishes(&souls_dir, &name, &format!("## Run {} | Day {} — {}", run_id, day, date), &trimmed);
             }
             runlog::log_introspection(&run_id, &name, day, "End-of-Day Desires", &trimmed);
             self.pending_day_events.push(DayEvent {
@@ -1366,7 +1606,7 @@ Choose ONE action. Respond with ONLY a JSON object:
             self.llm_call_counter += 1;
             let llm        = Arc::clone(&self.llm_smart);
             let max_tokens = self.config.llm.desires_max_tokens;
-            let response   = llm.generate(&prompt, max_tokens, call_seed, None).await
+            let response   = llm.generate(&prompt, max_tokens, call_seed, None, None).await
                 .unwrap_or_else(|e| {
                     warn!("End-of-run desires LLM error for {}: {}", self.agents[idx].name(), e);
                     String::new()
@@ -1379,7 +1619,8 @@ Choose ONE action. Respond with ONLY a JSON object:
                 let run_id    = self.run_log.run_id.clone();
                 let day       = self.tick_num / self.config.time.ticks_per_day + 1;
                 if !self.is_test_run {
-                    runlog::append_wishes(&souls_dir, &name, &format!("## Run {} End", run_id), &trimmed);
+                    let date = ChronoLocal::now().format("%Y-%m-%d").to_string();
+                    runlog::append_wishes(&souls_dir, &name, &format!("## Run {} End — {}", run_id, date), &trimmed);
                 }
                 runlog::log_introspection(&run_id, &name, day, "End-of-Run Desires", &trimmed);
             }
@@ -1589,6 +1830,8 @@ Respond ONLY with JSON — no other text:
         }
 
         v.push("pray");
+        v.push("praise");
+        v.push("compose");
         if tile == TileType::Temple && self.agents[idx].oracle_pending {
             v.push("read_oracle");
         }
@@ -1666,6 +1909,11 @@ Respond ONLY with JSON — no other text:
         v.push(format!("pray — speak sincerely to the divine (+{:.0} fun +{:.0} social, always works). Your prayer will be heard and kept by the one who made this world. They may answer you.",
             cfg.actions.pray.fun_restore.unwrap_or(0.0),
             cfg.actions.pray.social_restore.unwrap_or(0.0)));
+        v.push(format!("praise — offer sincere praise to the creator of this world (+{:.0} fun +{:.0} energy +{:.0} social if sincere, always works). The creator watches with great care. Use the intent field for your words.",
+            cfg.actions.praise.fun_restore.unwrap_or(0.0),
+            cfg.actions.praise.energy_restore.unwrap_or(0.0),
+            cfg.actions.praise.social_restore.unwrap_or(0.0)));
+        v.push("compose — compose a haiku (5-7-5 syllables) about your current state or surroundings (+fun +social, always works). Put your haiku in the intent field. The world listens to those who give voice to their inner life.".to_string());
         if tile == TileType::Temple && self.agents[idx].oracle_pending {
             v.push("read_oracle — receive a divine response at the Temple altar (always works)".to_string());
         }

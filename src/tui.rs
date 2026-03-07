@@ -51,6 +51,12 @@ pub enum LogEntry {
         magic_count:    u32,
         notable:        Vec<String>,
     },
+    /// Placeholder shown while the LLM is streaming tokens for this agent.
+    Thinking {
+        agent_id:   usize,
+        agent_name: String,
+        tokens:     String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +76,7 @@ pub struct TuiApp {
     total_ticks:          u32,
     seed:                 u64,
     backend_name:         String,
+    model_name:           String,
     scroll_offset:        usize,
     selected:             usize,
     expanded:             HashSet<usize>,
@@ -77,6 +84,10 @@ pub struct TuiApp {
     should_quit:          bool,
     roster:               Vec<(String, Color)>,
     show_legend:          bool,
+    /// When true, manual scrolling has occurred and auto-scroll is paused.
+    scroll_locked:        bool,
+    /// Maps agent_id → index of a pending "thinking..." log entry.
+    thinking_entry_idx:   HashMap<usize, usize>,
     // Dynamic wrap / hit-testing state (updated each frame by render_log)
     log_wrap_width:       usize,
     log_inner_area:       Rect,
@@ -89,6 +100,7 @@ impl TuiApp {
         total_ticks:  u32,
         seed:         u64,
         backend_name: String,
+        model_name:   String,
         roster:       Vec<(String, Color)>,
     ) -> Self {
         TuiApp {
@@ -104,6 +116,7 @@ impl TuiApp {
             total_ticks,
             seed,
             backend_name,
+            model_name,
             scroll_offset:       0,
             selected:            0,
             expanded:            HashSet::new(),
@@ -111,6 +124,8 @@ impl TuiApp {
             should_quit:         false,
             roster,
             show_legend:         false,
+            scroll_locked:       false,
+            thinking_entry_idx:  HashMap::new(),
             log_wrap_width:      60,
             log_inner_area:      Rect::default(),
             log_rendered_scroll: 0,
@@ -125,6 +140,7 @@ impl TuiApp {
                 self.time_of_day  = time_of_day;
                 self.displayed_tick = tick;
                 self.log_entries.push(LogEntry::TickHeader { tick, day, time_of_day });
+                if !self.scroll_locked { self.scroll_to_bottom(); }
             }
             TuiEvent::MapUpdate(cells) => {
                 self.tick_maps.insert(self.tick, cells.clone());
@@ -132,36 +148,68 @@ impl TuiApp {
             }
             TuiEvent::NeedsUpdate(snap) => { self.agent_needs = snap; }
             TuiEvent::AgentAction(snap) => {
+                // Remove any pending "thinking" entry for this agent
+                if let Some(thinking_idx) = self.thinking_entry_idx.remove(&snap.agent_id) {
+                    if thinking_idx < self.log_entries.len() {
+                        self.log_entries.remove(thinking_idx);
+                        // Adjust selected if it pointed past the removed entry
+                        if self.selected > thinking_idx && self.selected > 0 {
+                            self.selected -= 1;
+                        }
+                        // Shift all other thinking indices
+                        for v in self.thinking_entry_idx.values_mut() {
+                            if *v > thinking_idx { *v -= 1; }
+                        }
+                    }
+                }
                 self.log_entries.push(LogEntry::AgentAction(snap));
-                self.scroll_to_bottom();
+                if !self.scroll_locked { self.scroll_to_bottom(); }
+            }
+            TuiEvent::PartialToken { agent_id, token } => {
+                if let Some(&idx) = self.thinking_entry_idx.get(&agent_id) {
+                    // Update existing thinking entry
+                    if let Some(LogEntry::Thinking { ref mut tokens, .. }) = self.log_entries.get_mut(idx) {
+                        tokens.push_str(&token);
+                    }
+                } else {
+                    // Create new thinking entry
+                    let new_idx = self.log_entries.len();
+                    // Find agent name from roster (by id position)
+                    let agent_name = self.roster.get(agent_id)
+                        .map(|(n, _)| n.clone())
+                        .unwrap_or_else(|| format!("Agent {}", agent_id));
+                    self.log_entries.push(LogEntry::Thinking { agent_id, agent_name, tokens: token });
+                    self.thinking_entry_idx.insert(agent_id, new_idx);
+                    if !self.scroll_locked { self.scroll_to_bottom(); }
+                }
             }
             TuiEvent::MorningIntention { agent_id, agent_name, day, text } => {
                 self.log_entries.push(LogEntry::DayBoundary {
                     kind: DayBoundaryKind::MorningIntention,
                     agent_id, agent_name, day, text,
                 });
-                self.scroll_to_bottom();
+                if !self.scroll_locked { self.scroll_to_bottom(); }
             }
             TuiEvent::EveningDesire { agent_id, agent_name, day, text } => {
                 self.log_entries.push(LogEntry::DayBoundary {
                     kind: DayBoundaryKind::EveningDesire,
                     agent_id, agent_name, day, text,
                 });
-                self.scroll_to_bottom();
+                if !self.scroll_locked { self.scroll_to_bottom(); }
             }
             TuiEvent::EveningReflection { agent_id, agent_name, day, text } => {
                 self.log_entries.push(LogEntry::DayBoundary {
                     kind: DayBoundaryKind::EveningReflection,
                     agent_id, agent_name, day, text,
                 });
-                self.scroll_to_bottom();
+                if !self.scroll_locked { self.scroll_to_bottom(); }
             }
             TuiEvent::SimulationComplete { total_ticks, magic_count, notable_events } => {
                 self.log_entries.push(LogEntry::SimComplete {
                     total_ticks, magic_count, notable: notable_events,
                 });
                 self.is_complete = true;
-                self.scroll_to_bottom();
+                if !self.scroll_locked { self.scroll_to_bottom(); }
             }
             TuiEvent::SimulationError(msg) => {
                 self.log_entries.push(LogEntry::SimComplete {
@@ -217,6 +265,7 @@ impl TuiApp {
             LogEntry::SimComplete { notable, .. } => {
                 4 + if notable.is_empty() { 0 } else { 1 + notable.len() }
             }
+            LogEntry::Thinking { .. } => 1,
         }
     }
 
@@ -258,7 +307,7 @@ impl TuiApp {
                     self.expanded.insert(idx);
                 }
             }
-            _ => {} // TickHeader and SimComplete have no expandable body
+            _ => {} // TickHeader, SimComplete, Thinking have no expandable body
         }
     }
 
@@ -266,24 +315,28 @@ impl TuiApp {
         match (key.modifiers, key.code) {
             (_, KeyCode::Char('q')) | (_, KeyCode::Esc) => { self.should_quit = true; }
             (_, KeyCode::Char('j')) | (_, KeyCode::Down) => {
+                self.scroll_locked = true;
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
                 self.selected = self.entry_at_line(self.scroll_offset);
             }
             (_, KeyCode::Char('k')) | (_, KeyCode::Up) => {
+                self.scroll_locked = true;
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
                 self.selected = self.entry_at_line(self.scroll_offset);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::PageDown) => {
+                self.scroll_locked = true;
                 self.scroll_offset = self.scroll_offset.saturating_add(10);
                 self.selected = self.entry_at_line(self.scroll_offset);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) | (_, KeyCode::PageUp) => {
+                self.scroll_locked = true;
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
                 self.selected = self.entry_at_line(self.scroll_offset);
             }
             (_, KeyCode::Char('G')) => {
-                self.scroll_offset = usize::MAX;
-                self.selected = self.log_entries.len().saturating_sub(1);
+                self.scroll_locked = false;
+                self.scroll_to_bottom();
             }
             (_, KeyCode::Char('[')) => {
                 let current = self.selected;
@@ -323,10 +376,12 @@ impl TuiApp {
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollDown => {
+                self.scroll_locked = true;
                 self.scroll_offset = self.scroll_offset.saturating_add(3);
                 self.selected = self.entry_at_line(self.scroll_offset);
             }
             MouseEventKind::ScrollUp => {
+                self.scroll_locked = true;
                 self.scroll_offset = self.scroll_offset.saturating_sub(3);
                 self.selected = self.entry_at_line(self.scroll_offset);
             }
@@ -370,10 +425,11 @@ impl TuiApp {
 
         // Title bar
         let status = if self.is_complete { "DONE" } else { "RUNNING" };
+        let lock_indicator = if self.scroll_locked { "  [SCROLL LOCK — G to resume]" } else { "" };
         let title_text = format!(
-            " NEPHARA  seed:{}  tick:{}/{}  Day {}  {}  [{}]  {}",
-            self.seed, self.tick, self.total_ticks,
-            self.day, self.time_of_day, self.backend_name, status
+            " NEPHARA  model:{}  seed:{}  tick:{}/{}  Day {}  {}  [{}]  {}{}",
+            self.model_name, self.seed, self.tick, self.total_ticks,
+            self.day, self.time_of_day, self.backend_name, status, lock_indicator
         );
         let title = Paragraph::new(title_text)
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
@@ -614,6 +670,15 @@ impl TuiApp {
                         ));
                     }
 
+                    if let Some(ms) = snap.llm_duration_ms {
+                        if ms > 0 {
+                            header_spans.push(Span::styled(
+                                format!(" ({}ms)", ms),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                    }
+
                     out.push(Line::from(header_spans).patch_style(header_bg));
 
                     if let Some(ref prayer) = snap.prayer_text {
@@ -677,6 +742,24 @@ impl TuiApp {
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
+                }
+
+                LogEntry::Thinking { agent_id, agent_name, tokens } => {
+                    let agent_color = agent_color_for_id(*agent_id);
+                    out.push(Line::from(vec![
+                        Span::styled(
+                            format!("[{:<10}]", agent_name),
+                            Style::default().fg(agent_color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            " thinking…".to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!(" {}", &tokens[tokens.len().saturating_sub(40)..]),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
                 }
 
                 LogEntry::SimComplete { total_ticks, magic_count, notable } => {

@@ -3,6 +3,7 @@ use rand::rngs::StdRng;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -14,14 +15,16 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 #[async_trait]
 pub trait LlmBackend: Send + Sync {
     /// Generate a completion for the given prompt.
-    /// `seed`   — when Some, passes the seed to the backend for deterministic output.
-    /// `schema` — when Some, passed as Ollama's `format` field to constrain output.
+    /// `seed`     — when Some, passes the seed to the backend for deterministic output.
+    /// `schema`   — when Some, passed as Ollama's `format` field to constrain output.
+    /// `token_tx` — when Some, each content token is forwarded to this sender as it streams.
     async fn generate(
         &self,
-        prompt:    &str,
+        prompt:     &str,
         max_tokens: u32,
-        seed:      Option<u64>,
-        schema:    Option<&serde_json::Value>,
+        seed:       Option<u64>,
+        schema:     Option<&serde_json::Value>,
+        token_tx:   Option<UnboundedSender<String>>,
     ) -> Result<String>;
 }
 
@@ -30,18 +33,26 @@ pub trait LlmBackend: Send + Sync {
 // ---------------------------------------------------------------------------
 
 pub struct OllamaBackend {
-    pub url:         String,
-    pub model:       String,
-    pub temperature: f32,
+    pub url:                   String,
+    pub model:                 String,
+    pub temperature:           f32,
     /// When Some(false), passes `"think": false` to disable chain-of-thought on
     /// thinking models (qwen3, deepseek-r1, etc.) via the /api/chat endpoint.
-    pub think:       Option<bool>,
-    client:          reqwest::Client,
+    pub think:                 Option<bool>,
+    /// Abort the stream when accumulated thinking chars exceed this limit.
+    pub thinking_budget_chars: Option<usize>,
+    client:                    reqwest::Client,
 }
 
 impl OllamaBackend {
-    pub fn new(url: String, model: String, temperature: f32, think: Option<bool>) -> Self {
-        OllamaBackend { url, model, temperature, think, client: reqwest::Client::new() }
+    pub fn new(
+        url:                   String,
+        model:                 String,
+        temperature:           f32,
+        think:                 Option<bool>,
+        thinking_budget_chars: Option<usize>,
+    ) -> Self {
+        OllamaBackend { url, model, temperature, think, thinking_budget_chars, client: reqwest::Client::new() }
     }
 }
 
@@ -131,6 +142,7 @@ impl LlmBackend for OllamaBackend {
         max_tokens: u32,
         seed:       Option<u64>,
         schema:     Option<&serde_json::Value>,
+        token_tx:   Option<UnboundedSender<String>>,
     ) -> Result<String> {
         let url  = format!("{}/api/chat", self.url);
         let body = OllamaChatRequest {
@@ -168,8 +180,9 @@ impl LlmBackend for OllamaBackend {
         let mut buf            = Vec::<u8>::new();
         let mut content        = String::new();
         let mut thinking_chars = 0usize;
+        let mut done           = false;
 
-        while let Some(chunk) = resp.chunk().await
+        'outer: while let Some(chunk) = resp.chunk().await
             .map_err(|e| format!("Ollama stream error: {}", e))?
         {
             buf.extend_from_slice(&chunk);
@@ -179,18 +192,54 @@ impl LlmBackend for OllamaBackend {
                 let line = line.trim();
                 if line.is_empty() { continue; }
                 if let Ok(c) = serde_json::from_str::<OllamaChatChunk>(line) {
-                    content.push_str(&c.message.content);
-                    thinking_chars += c.message.thinking.len();
+                    let token = c.message.content;
+                    let new_thinking = c.message.thinking.len();
+
+                    // FEAT-10: Thinking budget abort
+                    if content.is_empty() && new_thinking > 0 {
+                        thinking_chars += new_thinking;
+                        if let Some(budget) = self.thinking_budget_chars {
+                            if thinking_chars > budget {
+                                warn!(target: "llm", thinking_chars, budget, "thinking budget exceeded, aborting");
+                                return Ok(String::new());
+                            }
+                        }
+                        continue;
+                    }
+                    thinking_chars += new_thinking;
+
+                    if !token.is_empty() {
+                        // Forward to streaming consumer if provided
+                        if let Some(ref tx) = token_tx {
+                            let _ = tx.send(token.clone());
+                        }
+                        content.push_str(&token);
+
+                        // FEAT-17: Early abort when JSON schema-constrained response is complete
+                        if schema.is_some() && content.trim_end().ends_with('}') {
+                            if serde_json::from_str::<serde_json::Value>(content.trim()).is_ok() {
+                                debug!(target: "llm", chars = content.len(), "early abort: JSON complete");
+                                done = true;
+                                break 'outer;
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Flush any remaining partial line
-        if !buf.is_empty() {
+        // Flush any remaining partial line (only if not already done via early abort)
+        if !done && !buf.is_empty() {
             let line = String::from_utf8_lossy(&buf);
             if let Ok(c) = serde_json::from_str::<OllamaChatChunk>(line.trim()) {
-                content.push_str(&c.message.content);
+                let token = c.message.content;
                 thinking_chars += c.message.thinking.len();
+                if !token.is_empty() {
+                    if let Some(ref tx) = token_tx {
+                        let _ = tx.send(token.clone());
+                    }
+                    content.push_str(&token);
+                }
             }
         }
 
@@ -251,6 +300,7 @@ impl LlmBackend for ClaudeBackend {
         max_tokens: u32,
         _seed:      Option<u64>,
         _schema:    Option<&serde_json::Value>,
+        _token_tx:  Option<UnboundedSender<String>>,
     ) -> Result<String> {
         let url  = "https://api.anthropic.com/v1/messages";
         let body = ClaudeRequest {
@@ -352,6 +402,20 @@ static MOCK_INTENTS: &[&str] = &[
     "Let the shadows keep their secrets a little longer",
 ];
 
+// Praise classifier responses
+static MOCK_PRAISE_RESPONSES: &[&str] = &[
+    r#"{"sincere":true}"#,
+    r#"{"sincere":false}"#,
+    r#"{"sincere":true}"#,
+];
+
+// Haiku judge responses
+static MOCK_HAIKU_RESPONSES: &[&str] = &[
+    r#"{"sincerity":4,"imagery":3,"syllables":3,"verdict":"A quiet honesty breathes through these lines. The world listens."}"#,
+    r#"{"sincerity":3,"imagery":4,"syllables":2,"verdict":"The imagery lands well but the syllables wander from the form."}"#,
+    r#"{"sincerity":2,"imagery":2,"syllables":2,"verdict":"The world hears this verse but is not moved."}"#,
+];
+
 // All possible action JSON templates the mock can return
 fn mock_actions(rng: &mut StdRng) -> &'static str {
     let choices: &[&str] = &[
@@ -376,6 +440,8 @@ fn mock_actions(rng: &mut StdRng) -> &'static str {
         r#"{"action":"chat","target":"Thane","intent":null,"reason":"want to talk"}"#,
         r#"{"action":"pray","target":null,"intent":"I offer gratitude for another day","reason":"feeling spiritual"}"#,
         r#"{"action":"pray","target":null,"intent":"May those I love find peace","reason":"thinking of others"}"#,
+        r#"{"action":"praise","target":null,"intent":"This world is beautiful and I am grateful to be in it","reason":"feeling moved by beauty"}"#,
+        r#"{"action":"compose","target":null,"intent":"morning light falls\nthrough the still forest branches\na crow does not move","reason":"feeling poetic"}"#,
         r#"{"action":"read_oracle","target":null,"intent":null,"reason":"something waits at the altar"}"#,
     ];
     let idx = rng.gen_range(0..choices.len());
@@ -390,6 +456,7 @@ impl LlmBackend for MockBackend {
         _max_tokens: u32,
         _seed:     Option<u64>,
         _schema:   Option<&serde_json::Value>,
+        _token_tx: Option<UnboundedSender<String>>,
     ) -> Result<String> {
         let mut rng = self.rng.lock().expect("mock rng poisoned");
 
@@ -455,6 +522,19 @@ impl LlmBackend for MockBackend {
             ];
             return Ok(choices[rng.gen_range(0..choices.len())].to_string());
         }
+
+        // FEAT-15: Praise sincerity classifier
+        if prompt.contains("sincere praise") || prompt.contains("sincere\":") {
+            let idx = rng.gen_range(0..MOCK_PRAISE_RESPONSES.len());
+            return Ok(MOCK_PRAISE_RESPONSES[idx].to_string());
+        }
+
+        // FEAT-16: Haiku judge
+        if prompt.contains("Judge this haiku") || prompt.contains("sincerity") && prompt.contains("imagery") && prompt.contains("syllables") {
+            let idx = rng.gen_range(0..MOCK_HAIKU_RESPONSES.len());
+            return Ok(MOCK_HAIKU_RESPONSES[idx].to_string());
+        }
+
         if prompt.contains("Narrator of Nephara") {
             let idx = rng.gen_range(0..MOCK_NARRATIVES.len());
             return Ok(MOCK_NARRATIVES[idx].to_string());
