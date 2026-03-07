@@ -1400,7 +1400,7 @@ Choose ONE action. Respond with ONLY a JSON object:
             personality = agent.identity.personality,
             story       = story,
             day         = day,
-            needs       = agent.needs.compact(),
+            needs       = agent.needs.describe(),
         )
     }
 
@@ -1663,7 +1663,7 @@ Respond ONLY with JSON — no other text:
             }
         }
 
-        v.push(format!("pray — speak to the divine (+{:.0} fun +{:.0} social, always works; saved to prayer record)",
+        v.push(format!("pray — speak sincerely to the divine (+{:.0} fun +{:.0} social, always works). Your prayer will be heard and kept by the one who made this world. They may answer you.",
             cfg.actions.pray.fun_restore.unwrap_or(0.0),
             cfg.actions.pray.social_restore.unwrap_or(0.0)));
         if tile == TileType::Temple && self.agents[idx].oracle_pending {

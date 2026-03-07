@@ -133,6 +133,13 @@ impl Needs {
             self.hunger, self.energy, self.fun, self.social, self.hygiene
         )
     }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "Satiety: {:.0}/100, Energy: {:.0}/100, Fun: {:.0}/100, Social: {:.0}/100, Hygiene: {:.0}/100",
+            self.hunger, self.energy, self.fun, self.social, self.hygiene
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
