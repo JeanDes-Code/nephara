@@ -167,6 +167,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 cfg.llm.ollama_url.clone(),
                 cfg.llm.model.clone(),
                 cfg.llm.temperature,
+                cfg.llm.think,
             );
             if let Err(e) = ollama.health_check().await {
                 error!("{}", e);
@@ -183,7 +184,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Some(model) => {
                 let smart_url = cfg.llm.smart_ollama_url.clone()
                     .unwrap_or_else(|| cfg.llm.ollama_url.clone());
-                let smart = OllamaBackend::new(smart_url, model.clone(), cfg.llm.temperature);
+                let smart = OllamaBackend::new(smart_url, model.clone(), cfg.llm.temperature, cfg.llm.think);
                 match smart.health_check().await {
                     Ok(_)  => {
                         info!("Smart model '{}' available for planning/reflection/desires", model);

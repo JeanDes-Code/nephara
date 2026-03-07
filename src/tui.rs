@@ -506,6 +506,7 @@ impl TuiApp {
         let max_scroll  = total_lines.saturating_sub(log_height);
         let scroll      = self.scroll_offset.min(max_scroll);
         self.log_rendered_scroll = scroll;
+        self.scroll_offset = scroll;   // normalize so j/k work from actual position
 
         let para = Paragraph::new(flat)
             .scroll((scroll as u16, 0));

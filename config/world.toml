@@ -112,17 +112,19 @@ state_dump_interval  = 48    # Dump every in-game day
 
 [llm]
 model                  = "gemma3:4b"
+# model                 = "qwen3.5:9b"  
 temperature            = 0.7
-max_tokens             = 150
+max_tokens             = 2000   # thinking models need room for <think> block before answer
 ollama_url             = "http://localhost:11434"
-interpreter_max_tokens = 300
-planning_max_tokens    = 60
-reflection_max_tokens  = 200
+interpreter_max_tokens = 2000
+planning_max_tokens    = 1000
+reflection_max_tokens  = 1500
 # smart_model      = "llama3:70b"     # optional: separate model for planning/reflection/desires
 # smart_ollama_url = "http://localhost:11435"  # separate Ollama for the smart model
-narrator_max_tokens    = 120
-desires_max_tokens     = 300
-oracle_max_tokens      = 100
+think = false                        # set to false to disable chain-of-thought on thinking models (qwen3, deepseek-r1, etc.)
+narrator_max_tokens    = 1000
+desires_max_tokens     = 2000
+oracle_max_tokens      = 1500
 
 [world]
 resource_respawn_ticks = 20
