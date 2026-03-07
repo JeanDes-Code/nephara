@@ -33,28 +33,34 @@ pub struct OllamaBackend {
     pub url:         String,
     pub model:       String,
     pub temperature: f32,
+    /// When Some(false), passes `"think": false` to disable chain-of-thought on
+    /// thinking models (qwen3, deepseek-r1, etc.) via the /api/chat endpoint.
+    pub think:       Option<bool>,
     client:          reqwest::Client,
 }
 
 impl OllamaBackend {
-    pub fn new(url: String, model: String, temperature: f32) -> Self {
-        OllamaBackend {
-            url,
-            model,
-            temperature,
-            client: reqwest::Client::new(),
-        }
+    pub fn new(url: String, model: String, temperature: f32, think: Option<bool>) -> Self {
+        OllamaBackend { url, model, temperature, think, client: reqwest::Client::new() }
     }
 }
 
 #[derive(Serialize)]
-struct OllamaRequest<'a> {
-    model:   &'a str,
-    prompt:  &'a str,
-    stream:  bool,
-    options: OllamaOptions,
+struct OllamaChatRequest<'a> {
+    model:    &'a str,
+    messages: Vec<OllamaUserMessage<'a>>,
+    stream:   bool,
+    options:  OllamaOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
-    format:  Option<&'a serde_json::Value>,
+    format:   Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think:    Option<bool>,
+}
+
+#[derive(Serialize)]
+struct OllamaUserMessage<'a> {
+    role:    &'static str,
+    content: &'a str,
 }
 
 #[derive(Serialize)]
@@ -66,8 +72,16 @@ struct OllamaOptions {
 }
 
 #[derive(Deserialize)]
-struct OllamaResponse {
-    response: String,
+struct OllamaChatChunk {
+    message: OllamaChatContent,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatContent {
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    thinking: String,
 }
 
 #[derive(Deserialize)]
@@ -113,27 +127,30 @@ impl OllamaBackend {
 impl LlmBackend for OllamaBackend {
     async fn generate(
         &self,
-        prompt:    &str,
+        prompt:     &str,
         max_tokens: u32,
-        seed:      Option<u64>,
-        schema:    Option<&serde_json::Value>,
+        seed:       Option<u64>,
+        schema:     Option<&serde_json::Value>,
     ) -> Result<String> {
-        let url  = format!("{}/api/generate", self.url);
-        let body = OllamaRequest {
-            model:  &self.model,
-            prompt,
-            stream: false,
-            options: OllamaOptions {
+        let url  = format!("{}/api/chat", self.url);
+        let body = OllamaChatRequest {
+            model:    &self.model,
+            messages: vec![OllamaUserMessage { role: "user", content: prompt }],
+            stream:   true,
+            options:  OllamaOptions {
                 temperature: seed.map(|_| 0.0).unwrap_or(self.temperature),
                 num_predict: max_tokens,
-                seed: seed.map(|s| s as i64),
+                seed:        seed.map(|s| s as i64),
             },
             format: schema,
+            think:  self.think,
         };
 
         debug!(target: "llm", model = %self.model, max_tokens = max_tokens,
-               prompt_chars = prompt.len(), has_schema = schema.is_some(), "LLM request");
-        let resp = self
+               prompt_chars = prompt.len(), has_schema = schema.is_some(),
+               think = ?self.think, "LLM request");
+
+        let mut resp = self
             .client
             .post(&url)
             .json(&body)
@@ -147,14 +164,39 @@ impl LlmBackend for OllamaBackend {
             return Err(format!("Ollama returned {}: {}", status, text).into());
         }
 
-        let ollama_resp: OllamaResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("Ollama JSON parse error: {}", e))?;
+        // Stream NDJSON chunks; accumulate content tokens; count thinking tokens separately.
+        let mut buf            = Vec::<u8>::new();
+        let mut content        = String::new();
+        let mut thinking_chars = 0usize;
 
-        let raw = ollama_resp.response;
-        debug!(target: "llm", chars = raw.len(), response = %raw, "LLM response");
-        Ok(raw)
+        while let Some(chunk) = resp.chunk().await
+            .map_err(|e| format!("Ollama stream error: {}", e))?
+        {
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                if let Ok(c) = serde_json::from_str::<OllamaChatChunk>(line) {
+                    content.push_str(&c.message.content);
+                    thinking_chars += c.message.thinking.len();
+                }
+            }
+        }
+
+        // Flush any remaining partial line
+        if !buf.is_empty() {
+            let line = String::from_utf8_lossy(&buf);
+            if let Ok(c) = serde_json::from_str::<OllamaChatChunk>(line.trim()) {
+                content.push_str(&c.message.content);
+                thinking_chars += c.message.thinking.len();
+            }
+        }
+
+        debug!(target: "llm", chars = content.len(), thinking_chars = thinking_chars,
+               response = %content, "LLM response");
+        Ok(content)
     }
 }
 

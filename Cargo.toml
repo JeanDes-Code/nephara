@@ -2,10 +2,15 @@
 name = "nephara"
 version = "0.1.0"
 edition = "2021"
+default-run = "nephara"
 
 [[bin]]
 name = "nephara"
 path = "src/main.rs"
+
+[[bin]]
+name = "probe_ollama"
+path = "src/bin/probe_ollama.rs"
 
 [dependencies]
 tokio        = { version = "1",    features = ["full"] }
