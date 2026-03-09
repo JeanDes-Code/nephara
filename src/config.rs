@@ -94,7 +94,16 @@ pub struct ResolutionConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct MemoryConfig {
     pub buffer_size: usize,
+    /// Maximum number of day summaries kept in long-term memory.
+    #[serde(default = "default_max_day_summaries")]
+    pub max_day_summaries: usize,
+    /// Max tokens for the day-summary LLM call.
+    #[serde(default = "default_summary_max_tokens")]
+    pub summary_max_tokens: u32,
 }
+
+fn default_max_day_summaries() -> usize { 7 }
+fn default_summary_max_tokens() -> u32 { 500 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SimulationConfig {

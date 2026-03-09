@@ -357,6 +357,9 @@ impl World {
                     self.end_of_day_reflection(idx, prev_day).await?;
                 }
                 for idx in 0..self.agents.len() {
+                    self.end_of_day_summary(idx, prev_day).await?;
+                }
+                for idx in 0..self.agents.len() {
                     self.end_of_day_desires(idx, prev_day).await?;
                 }
             }
@@ -1395,6 +1398,15 @@ impl World {
         } else {
             agent.life_story.clone()
         };
+        let ltm_block = if agent.long_term_memory.is_empty() {
+            String::new()
+        } else {
+            let summaries = agent.long_term_memory.iter()
+                .map(|s| format!("  - {}", s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\nPAST DAYS:\n{}\n", summaries)
+        };
         let intentions_block = match &agent.daily_intentions {
             Some(i) => i.clone(),
             None    => "(the day is just beginning)".to_string(),
@@ -1419,7 +1431,7 @@ impl World {
 {self_decl_block}{magic_block}
 YOUR STORY SO FAR:
 {story}
-
+{ltm}
 TODAY'S INTENTION:
 {intentions}
 
@@ -1458,6 +1470,7 @@ Choose ONE action. Respond with ONLY a JSON object:
             self_decl_block  = self_decl_block,
             magic_block      = magic_block,
             story            = story_block,
+            ltm              = ltm_block,
             intentions       = intentions_block,
             loc_name         = loc_name,
             loc_desc         = loc_desc,
@@ -1557,6 +1570,36 @@ Choose ONE action. Respond with ONLY a JSON object:
                 day,
                 text:       trimmed,
             });
+        }
+        Ok(())
+    }
+
+    async fn end_of_day_summary(
+        &mut self,
+        idx: usize,
+        day: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let prompt     = self.build_summary_prompt(idx, day);
+        let call_seed  = Some(self.seed.wrapping_add(self.llm_call_counter));
+        self.llm_call_counter += 1;
+        let llm        = Arc::clone(&self.llm_smart);
+        let max_tokens = self.config.memory.summary_max_tokens;
+        let response   = llm.generate(&prompt, max_tokens, call_seed, None, None).await
+            .unwrap_or_else(|e| {
+                warn!("Day summary LLM error for {}: {}", self.agents[idx].name(), e);
+                String::new()
+            });
+        self.run_log.write_llm_debug("day_summary", self.agents[idx].name(), &prompt, &response);
+        let trimmed = response.trim().to_string();
+        if !trimmed.is_empty() {
+            let name = self.agents[idx].name().to_string();
+            let max_summaries = self.config.memory.max_day_summaries;
+            let entry = format!("Day {}: {}", day, trimmed);
+            debug!(target: "memory", agent = %name, day = day, "Long-term memory updated");
+            self.agents[idx].long_term_memory.push(entry);
+            while self.agents[idx].long_term_memory.len() > max_summaries {
+                self.agents[idx].long_term_memory.remove(0);
+            }
         }
         Ok(())
     }
@@ -1665,6 +1708,22 @@ Choose ONE action. Respond with ONLY a JSON object:
             story       = story,
             day         = day,
             memories    = mem_block,
+        )
+    }
+
+    fn build_summary_prompt(&self, idx: usize, day: u32) -> String {
+        let agent     = &self.agents[idx];
+        let today_mems = agent.today_memories(day);
+        let mem_block  = if today_mems.is_empty() {
+            "  - (quiet day — nothing notable)".to_string()
+        } else {
+            today_mems.iter().map(|m| format!("  - {}", m)).collect::<Vec<_>>().join("\n")
+        };
+        format!(
+            "You are {name}.\n\nEverything that happened to you on Day {day}:\n{memories}\n\nCompress this into 1-2 factual sentences. Focus on what you did, who you interacted with, and anything notable. Write in first person, past tense. Be specific and concise.",
+            name     = agent.identity.name,
+            day      = day,
+            memories = mem_block,
         )
     }
 

@@ -203,6 +203,8 @@ pub struct Agent {
     pub life_story:        String,
     pub desires:           Option<String>,
     pub oracle_pending:    bool,
+    /// Compressed per-day summaries, oldest first. Kept to `max_day_summaries`.
+    pub long_term_memory:  Vec<String>,
 }
 
 impl Agent {
@@ -233,6 +235,7 @@ impl Agent {
             life_story:        String::new(),
             desires:           None,
             oracle_pending:    false,
+            long_term_memory:  Vec::new(),
         }
     }
 

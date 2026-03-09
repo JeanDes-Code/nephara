@@ -103,7 +103,9 @@ dc_hard       = 16
 night_dc_bonus = 4   # Added to Forage/Explore DCs at night
 
 [memory]
-buffer_size = 20
+buffer_size        = 20
+max_day_summaries  = 7    # Keep last 7 days of compressed summaries in long-term memory
+summary_max_tokens = 500  # Token budget for the end-of-day summary LLM call
 
 [simulation]
 # default_run_ticks    = 144   # 3 days
